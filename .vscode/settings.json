@@ -1,0 +1,9 @@
+{
+  "jupyter.jupyterServerType": "local",
+  "python.pythonPath": "/home/baihe/anaconda3/bin/python",
+  "python.envFile": "${workspaceFolder}/.vscode/.env",
+  "python.terminal.activateEnvironment": false,
+  "terminal.integrated.env.linux": {
+    "PATH": "/home/baihe/anaconda3/bin:/home/baihe/anaconda3/condabin:/home/baihe/anaconda3/bin:/home/baihe/anaconda3/bin:/opt/conda/bin:/opt/cmake-3.14.6-Linux-x86_64/bin:/usr/local/mpi/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin:/opt/tensorrt/bin"
+  }
+}

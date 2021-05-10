@@ -4,21 +4,21 @@ import time
 import math
 import os, sys
 import itertools
-
+import logging
 import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+from tensorboard.compat import tf
 from data_utils import get_lm_corpus
-from mem_transformer import MemTransformerLM, SegaMemTransformerLM,\
-    Sega_wo_p_MemTransformerLM,Sega_wo_s_MemTransformerLM#, LongTransformerLM
+from mem_transformer import MemTransformerLM
 from utils.exp_utils import create_exp_dir
 from utils.data_parallel import BalancedDataParallel
 
 parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model')
-parser.add_argument('--data', type=str, default='../data/wikitext-103',
+parser.add_argument('--data', type=str, default=os.getenv('PT_DATA_DIR', 'data'),
                     help='location of the data corpus')
 parser.add_argument('--dataset', type=str, default='wt103',
                     choices=['wt103', 'lm1b', 'enwik8', 'text8'],
@@ -35,7 +35,7 @@ parser.add_argument('--d_model', type=int, default=500,
                     help='model dimension')
 parser.add_argument('--d_inner', type=int, default=1000,
                     help='inner dimension in FF')
-parser.add_argument('--dropout', type=float, default=0.0,
+parser.add_argument('--dropout', type=float, default=0.1,
                     help='global dropout rate')
 parser.add_argument('--dropatt', type=float, default=0.0,
                     help='attention probability dropout rate')
@@ -148,7 +148,11 @@ parser.add_argument('--static-loss-scale', type=float, default=1,
 parser.add_argument('--dynamic-loss-scale', action='store_true',
                     help='Use dynamic loss scaling.  If supplied, this argument'
                     ' supersedes --static-loss-scale.')
+parser.add_argument('--pt', action='store_true',
+                    help='pt or not')
 args = parser.parse_args()
+breakpoint()
+
 args.tied = not args.not_tied
 
 if args.d_embed < 0:
@@ -160,12 +164,20 @@ if 'eos' in args.sparse_mode:
 assert args.ext_len >= 0, 'extended context length must be non-negative'
 assert args.batch_size % args.batch_chunk == 0
 
-args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
-#args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d-%H%M%S'))
-logging = create_exp_dir(args.work_dir,
-    scripts_to_save=['train.py', 'mem_transformer.py'], debug=args.debug)
-writer = SummaryWriter()
 
+# this hack is required to enable `pt monitor` *while the job is running*.
+delattr(tf.io.gfile.LocalFileSystem, 'append')
+
+if args.pt:
+    args.work_dir = os.environ.get('PT_OUTPUT_DIR', '.')
+    logging = create_exp_dir(args.work_dir, debug=args.debug)
+    writer = SummaryWriter(os.environ.get('PT_OUTPUT_DIR', '.'), flush_secs=30)
+else:
+    # args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
+    args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d'))
+    logging = create_exp_dir(args.work_dir, debug=args.debug)
+    writer = SummaryWriter()
+breakpoint()
 # Set the random seed manually for reproducibility.
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)

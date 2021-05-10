@@ -2,12 +2,13 @@
 export CUDA_VISIBLE_DEVICES=$1
 #        --multi_gpu \
 #        --gpu0_bsz 32 \
-WORKDIR="/home/baihe/project/Dynasparse-transformer/wiki103/$2"
+WORKDIR="/data/robustLM/output/$2"
+PYTHONPATH="/data/robustLM/src"
 if [[ $3 == 'train' ]]; then
     echo 'Run training...'
-    python -u train.py \
+    python -u src/train.py \
         --cuda \
-        --data /home/baihe/datasets/LM_data/CL/wikitext-103/ \
+        --data /data/robustLM/data/CL-wikitext-103 \
         --dataset wt103 \
         --adaptive \
         --n_layer 16 \
@@ -34,7 +35,7 @@ elif [[ $3 == 'eval' ]]; then
     echo 'Run evaluation...'
     python -u eval.py \
         --cuda \
-        --data /home/baihe/datasets/LM_data/CL/wikitext-103/ \
+        --data /data/robustLM/data/CL-wikitext-103 \
         --dataset wt103 \
         --tgt_len 400 \
         --mem_len 0 \

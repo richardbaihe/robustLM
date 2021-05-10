@@ -1,0 +1,54 @@
+
+target:
+  service: aml
+  # run "pt target list amlk8s" to list the names of available AMLK8s targets
+  name: canada24
+  # name: canada24
+  # vc: resrchvc
+
+    
+
+environment:
+  image: nvidia/pytorch:20.12-py3
+  registry: nvcr.io
+  setup:
+    - pip install tensorboard --user
+
+code:
+  local_dir: $CONFIG_DIR/src
+  
+data:
+  local_dir: $CONFIG_DIR/data/wikitext-103
+  remote_dir: data/wikitext-103
+
+# list of jobs to run, we run 2 jobs in this example
+jobs:
+- name: train
+  sku: G4
+  command:
+  - python train.py --dataset wt103
+    --n_layer 16
+    --d_model 410
+    --n_head 10
+    --d_head 41
+    --d_inner 2100
+    --tgt_len 150
+    --eval_tgt_len 150
+    --mem_len 0
+    --batch_size 64
+    --adaptive
+    --fp16
+    --dynamic-loss-scale
+    --multi_gpu
+    --cuda
+    --pt
+- name: test
+  sku: G4
+  command:
+  - python eval.py --dataset wt103
+    --tgt_len 400
+    --mem_len 0
+    --batch_size 10
+    --split test
+    --cuda
+    --pt

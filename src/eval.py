@@ -42,6 +42,8 @@ parser.add_argument('--sega', action='store_true',
                     help='sega or not')
 parser.add_argument('--sparse_mode', type=str, default='none',
                     help='spare mode for longformer')
+parser.add_argument('--pt', action='store_true',
+                    help='pt or not')
 args = parser.parse_args()
 assert args.ext_len >= 0, 'extended context length must be non-negative'
 args.sent_eos=False
@@ -52,10 +54,14 @@ if 'compress' in args.sparse_mode:
     args.compressed_mem=True
 device = torch.device("cuda" if args.cuda else "cpu")
 
-args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
-# Get logger
-logging = get_logger(os.path.join(args.work_dir, 'log.txt'),
-                     log_=not args.no_log)
+if args.pt:
+    args.work_dir = os.environ.get('PT_OUTPUT_DIR', '.')
+    logging.basicConfig(level=logging.INFO)
+else:
+    args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
+    # Get logger
+    logging = get_logger(os.path.join(args.work_dir, 'log.txt'),
+                        log_=not args.no_log)
 
 # Load dataset
 corpus = get_lm_corpus(args.data, args.dataset, sega=args.sega, sent_eos=args.sent_eos)

@@ -150,8 +150,10 @@ parser.add_argument('--dynamic-loss-scale', action='store_true',
                     ' supersedes --static-loss-scale.')
 parser.add_argument('--cl_softmax', action='store_true',
                     help='vocab contain classes or not')
-parser.add_argument('--cl_steps', type=int, default=20000,
+parser.add_argument('--cl_steps', type=int, default=0,
                     help='initial steps for classLM training')
+parser.add_argument('--cl_annealing', type=float, default=0,
+                    help='initial cl portion for mix training')
 parser.add_argument('--pt', action='store_true',
                     help='phillytool or local')
 args = parser.parse_args()
@@ -211,8 +213,6 @@ args.n_token = ntokens
 
 eval_batch_size = 10
 tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len,
-    device=device, ext_len=args.ext_len)
-tr_iter_cl = corpus.get_iterator('train_cl', args.batch_size, args.tgt_len,
     device=device, ext_len=args.ext_len)
 va_iter = corpus.get_iterator('valid', eval_batch_size, args.eval_tgt_len,
     device=device, ext_len=args.ext_len)
@@ -502,7 +502,11 @@ def train(data_iter, max_step):
         mems = tuple()
         mems_pst = tuple()
     train_iter = data_iter.get_varlen_iter() if args.varlen else data_iter
-    for batch, (data, target, seq_len, pst) in enumerate(train_iter):
+    for batch, (data, target, seq_len, pst, cl) in enumerate(train_iter):
+        if cl:
+            model.predict_root = True
+        else:
+            model.predict_root = False
         model.zero_grad()
         if args.batch_chunk > 1:
             data_chunks = torch.chunk(data, args.batch_chunk, 1)
@@ -582,12 +586,8 @@ def train(data_iter, max_step):
             log_start_time = time.time()
 
         if train_step % args.eval_interval == 0:
-            if model.predict_root:
-                model.predict_root = False
-                val_loss = evaluate(va_iter)
-                model.predict_root = True
-            else:
-                val_loss = evaluate(va_iter)
+            model.predict_root = False
+            val_loss = evaluate(va_iter)
             logging('-' * 100)
             log_str = '| Eval {:3d} at step {:>8d} | time: {:5.2f}s ' \
                       '| valid loss {:5.2f}'.format(
@@ -631,12 +631,23 @@ eval_start_time = time.time()
 # At any point you can hit Ctrl + C to break out of training early.
 try:
     for epoch in itertools.count(start=1):
-        if train_step<=args.cl_steps:
-            model.predict_root = True
-            train(tr_iter_cl, max_step=args.cl_steps)
-        else:
-            model.predict_root = False
+        if args.cl_steps!=0:
+            if train_step<=args.cl_steps:
+                cl_portion = 1
+                tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len, device=device, ext_len=args.ext_len, cl_portion=cl_portion)
+                train(tr_iter, max_step=args.cl_steps)
+            else:
+                cl_portion = 0
+                tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len, device=device, ext_len=args.ext_len, cl_portion=cl_portion)
+                train(tr_iter, max_step=args.max_step)
+        elif args.cl_annealing:
+            cl_portion = max(0, 0.8 - train_step/args.max_step)
+            tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len, device=device, ext_len=args.ext_len, cl_portion=cl_portion)
             train(tr_iter, max_step=args.max_step)
+        else:
+            train(tr_iter, max_step=args.max_step)
+
+            
         if train_step == args.max_step:
             logging('-' * 100)
             logging('End of training')
@@ -654,7 +665,7 @@ para_model = model.to(device)
 
 # Run on test data.
 if args.sega:
-    test_loss = evaluate_sega(te_iter)
+    test_loss = evaluate(te_iter)
 else:
     test_loss = evaluate(te_iter)
 logging('=' * 100)

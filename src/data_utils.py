@@ -271,31 +271,142 @@ def get_lm_corpus(datadir, dataset,sega=False,sent_eos=False, cl_vocab=False):
     if sent_eos:
         target_name = 'eos_'+target_name
     fn = os.path.join(datadir, target_name)
-    if os.path.exists(fn):
-        print('Loading cached dataset...')
-        corpus = torch.load(fn)
+    # if os.path.exists(fn):
+    #     print('Loading cached dataset...')
+    #     corpus = torch.load(fn)
+    # else:
+    print('Producing dataset {}...'.format(dataset))
+    kwargs = {}
+    if dataset in ['wt103', 'wt2']:
+        kwargs['special'] = ['<eos>','<sent_eos>']
+        kwargs['lower_case'] = False
+    elif dataset == 'ptb':
+        kwargs['special'] = ['<eos>']
+        kwargs['lower_case'] = True
+    elif dataset == 'lm1b':
+        kwargs['special'] = []
+        kwargs['lower_case'] = False
+        kwargs['vocab_file'] = os.path.join(datadir, '1b_word_vocab.txt')
+    elif dataset in ['enwik8', 'text8']:
+        pass
+    kwargs['sega'] = sega
+    kwargs['sent_eos'] = sent_eos
+    kwargs['cl_vocab'] = cl_vocab
+    if cl_vocab:
+        corpus = MixCorpus(datadir, dataset, **kwargs)
     else:
-        print('Producing dataset {}...'.format(dataset))
-        kwargs = {}
-        if dataset in ['wt103', 'wt2']:
-            kwargs['special'] = ['<eos>','<sent_eos>']
-            kwargs['lower_case'] = False
-        elif dataset == 'ptb':
-            kwargs['special'] = ['<eos>']
-            kwargs['lower_case'] = True
-        elif dataset == 'lm1b':
-            kwargs['special'] = []
-            kwargs['lower_case'] = False
-            kwargs['vocab_file'] = os.path.join(datadir, '1b_word_vocab.txt')
-        elif dataset in ['enwik8', 'text8']:
-            pass
-        kwargs['sega'] = sega
-        kwargs['sent_eos'] = sent_eos
-        kwargs['cl_vocab'] = cl_vocab
         corpus = Corpus(datadir, dataset, **kwargs)
-        torch.save(corpus, fn)
+        # torch.save(corpus, fn)
 
     return corpus
+
+
+class MixLMOrderedIterator(LMOrderedIterator):
+    def __init__(self, data, data_cl, bsz, bptt, device='cpu', ext_len=None, cl_portion=0):
+        """
+            data -- LongTensor -- the LongTensor is strictly ordered
+        """
+        self.bsz = bsz
+        self.bptt = bptt
+        self.ext_len = ext_len if ext_len is not None else 0
+        self.sega =  isinstance(data, tuple)
+        self.device = device
+        self.cl_portion = cl_portion*100
+        if self.sega:
+            data,p,s,t = data
+        assert data.size(0) == data_cl.size(0)
+        # Work out how cleanly we can divide the dataset into bsz parts.
+        self.n_step = data.size(0) // bsz
+
+        # Trim off any extra elements that wouldn't cleanly fit (remainders).
+        data = data.narrow(0, 0, self.n_step * bsz)
+        # Evenly divide the data across the bsz batches.
+        self.data = data.view(bsz, -1).t().contiguous().to(device)
+        data_cl = data_cl.narrow(0,0,self.n_step*bsz)
+        self.data_cl = data_cl.view(bsz, -1).t().contiguous().to(device)
+        if self.sega:
+            p = p.narrow(0, 0, self.n_step * bsz)
+            s = s.narrow(0, 0, self.n_step * bsz)
+            t = t.narrow(0, 0, self.n_step * bsz)
+            self.p = p.view(bsz, -1).t().contiguous().to(device)
+            self.s = s.view(bsz, -1).t().contiguous().to(device)
+            self.t = t.view(bsz, -1).t().contiguous().to(device)
+        # Number of mini-batches
+        self.n_batch = (self.n_step + self.bptt - 1) // self.bptt
+
+    def get_batch(self, i, bptt=None):
+        random_number = np.random.randint(1,101)
+        if random_number<=self.cl_portion:
+            cl = True
+        else:
+            cl = False
+        if bptt is None: bptt = self.bptt
+        seq_len = min(bptt, self.data.size(0) - 1 - i)
+
+        end_idx = i + seq_len
+        beg_idx = max(0, i - self.ext_len)
+        if cl:
+            data = self.data_cl[beg_idx:end_idx]
+            target = self.data_cl[i+1:i+1+seq_len]
+        else:
+            data = self.data[beg_idx:end_idx]
+            target = self.data[i+1:i+1+seq_len]
+        pst = tuple()
+        if self.sega:
+            pst = (self.p[beg_idx:end_idx], self.s[beg_idx:end_idx],self.t[beg_idx:end_idx])
+        return data, target, seq_len, pst, cl
+
+    def get_fixlen_iter(self, start=0):
+        for i in range(start, self.data.size(0) - 1, self.bptt):
+            yield self.get_batch(i)
+
+    def get_varlen_iter(self, start=0, std=5, min_len=5, max_deviation=3):
+        max_len = self.bptt + max_deviation * std
+        i = start
+        while True:
+            bptt = self.bptt if np.random.random() < 0.95 else self.bptt / 2.
+            bptt = min(max_len, max(min_len, int(np.random.normal(bptt, std))))
+            if self.sega:
+                data, target, seq_len, pst = self.get_batch(i, bptt)
+                i += seq_len
+                yield data, target, seq_len, pst
+            else:
+                data, target, seq_len = self.get_batch(i, bptt)
+                i += seq_len
+                yield data, target, seq_len
+            if i >= self.data.size(0) - 2:
+                break
+
+    def __iter__(self):
+        return self.get_fixlen_iter()
+
+
+class MixCorpus(object):
+    def __init__(self, path, dataset, sega, sent_eos, cl_vocab=False, *args, **kwargs):
+        self.dataset = dataset
+        self.vocab = Vocab(*args, **kwargs)
+        self.add_sent_eos = sent_eos
+
+        self.vocab.count_file(os.path.join(path, 'train.txt'),sega=sega,sent_eos=sent_eos)
+        self.vocab.count_cl_file(os.path.join(path, 'cl-train.txt'),sega=sega,sent_eos=sent_eos)
+        self.vocab.build_vocab()
+
+        self.train_cl = self.vocab.encode_file( 
+        os.path.join(path, 'cl-train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        self.train = self.vocab.encode_file( 
+            os.path.join(path, 'train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        self.valid = self.vocab.encode_file(
+            os.path.join(path, 'valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        self.test = self.vocab.encode_file(
+            os.path.join(path, 'test.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+
+    def get_iterator(self, split, *args, **kwargs):
+        if split == 'train':
+            data_iter = MixLMOrderedIterator(self.train,self.train_cl, *args, **kwargs)
+        elif split in ['valid', 'test']:
+            data = self.valid if split == 'valid' else self.test
+            data_iter = LMOrderedIterator(data, *args, **kwargs)
+        return data_iter
 
 if __name__ == '__main__':
     import argparse

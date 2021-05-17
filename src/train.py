@@ -107,9 +107,9 @@ parser.add_argument('--varlen', action='store_true',
                     help='use variable length')
 parser.add_argument('--multi_gpu', action='store_true',
                     help='use multiple GPU')
-parser.add_argument('--log-interval', type=int, default=200,
+parser.add_argument('--log_interval', type=int, default=200,
                     help='report interval')
-parser.add_argument('--eval-interval', type=int, default=4000,
+parser.add_argument('--eval_interval', type=int, default=4000,
                     help='evaluation interval')
 parser.add_argument('--work_dir', default='LM-TFM', type=str,
                     help='experiment directory.')
@@ -148,10 +148,13 @@ parser.add_argument('--static-loss-scale', type=float, default=1,
 parser.add_argument('--dynamic-loss-scale', action='store_true',
                     help='Use dynamic loss scaling.  If supplied, this argument'
                     ' supersedes --static-loss-scale.')
+parser.add_argument('--cl_softmax', action='store_true',
+                    help='vocab contain classes or not')
+parser.add_argument('--cl_steps', type=int, default=20000,
+                    help='initial steps for classLM training')
 parser.add_argument('--pt', action='store_true',
-                    help='pt or not')
+                    help='phillytool or local')
 args = parser.parse_args()
-breakpoint()
 
 args.tied = not args.not_tied
 
@@ -164,20 +167,16 @@ if 'eos' in args.sparse_mode:
 assert args.ext_len >= 0, 'extended context length must be non-negative'
 assert args.batch_size % args.batch_chunk == 0
 
-
-# this hack is required to enable `pt monitor` *while the job is running*.
-delattr(tf.io.gfile.LocalFileSystem, 'append')
-
 if args.pt:
+    # this hack is required to enable `pt monitor` *while the job is running*.
+    delattr(tf.io.gfile.LocalFileSystem, 'append')
     args.work_dir = os.environ.get('PT_OUTPUT_DIR', '.')
-    logging = create_exp_dir(args.work_dir, debug=args.debug)
-    writer = SummaryWriter(os.environ.get('PT_OUTPUT_DIR', '.'), flush_secs=30)
 else:
     # args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
     args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d'))
-    logging = create_exp_dir(args.work_dir, debug=args.debug)
-    writer = SummaryWriter()
-breakpoint()
+logging = create_exp_dir(args.work_dir, debug=args.debug)
+writer = SummaryWriter(args.work_dir, flush_secs=30)
+
 # Set the random seed manually for reproducibility.
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
@@ -204,12 +203,16 @@ device = torch.device('cuda' if args.cuda else 'cpu')
 ###############################################################################
 # Load data
 ###############################################################################
-corpus = get_lm_corpus(args.data, args.dataset, sega=args.sega, sent_eos=args.sent_eos)
+corpus = get_lm_corpus(args.data, args.dataset, sega=args.sega, sent_eos=args.sent_eos, cl_vocab=args.cl_softmax)
+cl_all_root_index = corpus.vocab.cl_root_tokens 
+cl_all_leaf_index = corpus.vocab.cl_leaf_tokens 
 ntokens = len(corpus.vocab)
 args.n_token = ntokens
 
 eval_batch_size = 10
 tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len,
+    device=device, ext_len=args.ext_len)
+tr_iter_cl = corpus.get_iterator('train_cl', args.batch_size, args.tgt_len,
     device=device, ext_len=args.ext_len)
 va_iter = corpus.get_iterator('valid', eval_batch_size, args.eval_tgt_len,
     device=device, ext_len=args.ext_len)
@@ -330,7 +333,8 @@ else:
             tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
             ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
             same_length=args.same_length, attn_type=args.attn_type,
-            clamp_len=args.clamp_len, sample_softmax=args.sample_softmax)
+            clamp_len=args.clamp_len, sample_softmax=args.sample_softmax, 
+            cl_all_root_index=cl_all_root_index, cl_all_leaf_index=cl_all_leaf_index)
     model.apply(weights_init)
     model.word_emb.apply(weights_init) # ensure embedding init is not overridden by out_layer in case of weight sharing
 args.n_all_param = sum([p.nelement() for p in model.parameters()])
@@ -453,10 +457,22 @@ def evaluate(eval_iter):
     total_len, total_loss = 0, 0.
     with torch.no_grad():
         mems = tuple()
-        for i, (data, target, seq_len) in enumerate(eval_iter):
+        mems_pst = tuple()
+        for i, (data, target, seq_len, pst) in enumerate(eval_iter):
             if args.max_eval_steps > 0 and i >= args.max_eval_steps:
                 break
-            ret = model(data, target, *mems)
+            if args.sega:
+                ret = model(data, target, mems, pst, mems_pst)
+                new_pst = []		
+                if not mems_pst:		
+                    mems_pst = pst		
+                else:		
+                    for t, m_t in zip(pst, mems_pst):		
+                        cat = torch.cat([m_t, t], dim=0)		
+                        new_pst.append(cat[max(0, len(cat) - model.mem_len):])		
+                    mems_pst = tuple(new_pst)
+            else:
+                ret = model(data, target, *mems)
             loss, mems = ret[0], ret[1:]
             if args.sent_eos:
                 sent_eos_pos = target==corpus.vocab.sent_eos_idx
@@ -475,75 +491,7 @@ def evaluate(eval_iter):
     return total_loss / total_len
 
 
-def evaluate_sega(eval_iter):
-    # Turn on evaluation mode which disables dropout.
-    model.eval()
-
-    # If the model does not use memory at all, make the ext_len longer.
-    # Otherwise, make the mem_len longer and keep the ext_len the same.
-    if args.mem_len == 0:
-        model.reset_length(args.eval_tgt_len,
-            args.ext_len+args.tgt_len-args.eval_tgt_len, args.mem_len)
-    else:
-        model.reset_length(args.eval_tgt_len,
-            args.ext_len, args.mem_len+args.tgt_len-args.eval_tgt_len)
-
-    # Evaluation
-    total_len, total_loss = 0, 0.
-    with torch.no_grad():
-        mems = tuple()
-        mems_pst = tuple()
-        for i, (data, target, seq_len, pst) in enumerate(eval_iter):
-            if args.max_eval_steps > 0 and i >= args.max_eval_steps:
-                break
-            ret = model(data, target, mems, pst, mems_pst)
-            loss, mems= ret[0], ret[1:]
-            new_pst = []
-            if not mems_pst:
-                mems_pst = pst
-            else:
-                for t, m_t in zip(pst, mems_pst):
-                    cat = torch.cat([m_t, t], dim=0)
-                    new_pst.append(cat[max(0, len(cat) - model.mem_len):])
-                mems_pst = tuple(new_pst)
-            # new_pst = []
-            # end_idx = args.mem_len + max(0, data.size(0) - 0 - args.ext_len)
-            # beg_idx = max(0, end_idx - args.mem_len)
-            # for t,m_t in zip(pst,mems_pst):
-            #     cat = torch.cat([m_t, t], dim=0)
-            #     new_pst.append(cat[beg_idx:end_idx].detach())
-            # if not mems_pst:
-            #     mems_pst=pst
-            # else:
-            #     mems_pst = new_pst
-            if args.sent_eos:
-                sent_eos_pos = target==corpus.vocab.sent_eos_idx
-                loss = loss * (1-sent_eos_pos.contiguous().type(loss.type()))
-                total_loss += loss.sum().float().item()/target.shape[-1]
-                total_len += (seq_len*target.shape[-1]-torch.sum(sent_eos_pos)).float()/target.shape[-1]
-
-                # sent_eos_pos = target==corpus.vocab.sent_eos_idx
-                # para_eos_pos = target==corpus.vocab.eos_idx
-                # loss = loss * (1-sent_eos_pos.contiguous().type(loss.type())) * (1-para_eos_pos.contiguous().type(loss.type()))
-                # total_loss += loss.sum().float().item()/target.shape[-1]
-                # total_len += (seq_len*target.shape[-1]-torch.sum(sent_eos_pos)-torch.sum(para_eos_pos)).float()/target.shape[-1]
-            else:
-                loss = loss.mean()
-                total_loss += seq_len * loss.float().item()
-                total_len += seq_len
-                # para_eos_pos = target==corpus.vocab.eos_idx
-                # loss = loss * (1-para_eos_pos.contiguous().type(loss.type()))
-                # total_loss += loss.sum().float().item()/target.shape[-1]
-                # total_len += (seq_len*target.shape[-1]-torch.sum(para_eos_pos)).float()/target.shape[-1]
-
-    # Switch back to the training mode
-    model.reset_length(args.tgt_len, args.ext_len, args.mem_len)
-    model.train()
-
-    return total_loss / total_len
-
-
-def train_sega():
+def train(data_iter, max_step):
     # Turn on training mode which enables dropout.
     global train_step, train_loss, best_val_loss, eval_start_time, log_start_time
     model.train()
@@ -553,11 +501,10 @@ def train_sega():
     else:
         mems = tuple()
         mems_pst = tuple()
-    train_iter = tr_iter.get_varlen_iter() if args.varlen else tr_iter
+    train_iter = data_iter.get_varlen_iter() if args.varlen else data_iter
     for batch, (data, target, seq_len, pst) in enumerate(train_iter):
         model.zero_grad()
         if args.batch_chunk > 1:
-            raise NotImplementedError
             data_chunks = torch.chunk(data, args.batch_chunk, 1)
             target_chunks = torch.chunk(target, args.batch_chunk, 1)
             for i in range(args.batch_chunk):
@@ -572,135 +519,18 @@ def train_sega():
                     loss.backward()
                 train_loss += loss.float().item()
         else:
-            ret = para_model(data, target, mems, pst, mems_pst)
-            loss, mems= ret[0], ret[1:]
-            new_pst = []
-            if not mems_pst:
-                mems_pst = pst
+            if args.sega:
+                ret = para_model(data, target, mems, pst, mems_pst)
+                new_pst = []		
+                if not mems_pst:		
+                    mems_pst = pst		
+                else:		
+                    for t, m_t in zip(pst, mems_pst):		
+                        cat = torch.cat([m_t, t], dim=0)		
+                        new_pst.append(cat[max(0, len(cat) - model.mem_len):])		
+                    mems_pst = tuple(new_pst)
             else:
-                for t, m_t in zip(pst, mems_pst):
-                    cat = torch.cat([m_t, t], dim=0)
-                    new_pst.append(cat[max(0, len(cat) - model.mem_len):])
-                mems_pst = tuple(new_pst)
-
-            # new_pst = []
-            # end_idx = args.mem_len + max(0, data.size(0) - 0 - args.ext_len)
-            # beg_idx = max(0, end_idx - args.mem_len)
-            # for t,m_t in zip(pst,mems_pst):
-            #     cat = torch.cat([m_t,t], dim=0)
-            #     new_pst.append(cat[beg_idx:end_idx].detach())
-            # if not mems_pst:
-            #     mems_pst=pst
-            # else:
-            #     mems_pst = tuple(new_pst)
-            loss = loss.float().mean().type_as(loss)
-            if args.fp16:
-                optimizer.backward(loss)
-            else:
-                loss.backward()
-            train_loss += loss.float().item()
-
-        if args.fp16:
-            optimizer.clip_master_grads(args.clip)
-        else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-
-        optimizer.step()
-        if args.sample_softmax > 0:
-            optimizer_sparse.step()
-
-        # step-wise learning rate annealing
-        train_step += 1
-        if args.scheduler in ['cosine', 'constant', 'dev_perf']:
-            # linear warmup stage
-            if train_step < args.warmup_step:
-                curr_lr = args.lr * train_step / args.warmup_step
-                optimizer.param_groups[0]['lr'] = curr_lr
-                if args.sample_softmax > 0:
-                    optimizer_sparse.param_groups[0]['lr'] = curr_lr * 2
-            else:
-                if args.scheduler == 'cosine':
-                    scheduler.step(train_step)
-                    if args.sample_softmax > 0:
-                        scheduler_sparse.step(train_step)
-        elif args.scheduler == 'inv_sqrt':
-            scheduler.step(train_step)
-
-        if train_step % args.log_interval == 0:
-            cur_loss = train_loss / args.log_interval
-            elapsed = time.time() - log_start_time
-            log_str = '| epoch {:3d} step {:>8d} | {:>6d} batches | lr {:.3g} ' \
-                      '| ms/batch {:5.2f} | loss {:5.2f}'.format(
-                epoch, train_step, batch+1, optimizer.param_groups[0]['lr'],
-                elapsed * 1000 / args.log_interval, cur_loss)
-            if args.dataset in ['enwik8', 'text8']:
-                log_str += ' | bpc {:9.5f}'.format(cur_loss / math.log(2))
-            else:
-                log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
-            logging(log_str)
-            train_loss = 0
-            log_start_time = time.time()
-
-        if train_step % args.eval_interval == 0:
-            val_loss = evaluate_sega(va_iter)
-            logging('-' * 100)
-            log_str = '| Eval {:3d} at step {:>8d} | time: {:5.2f}s ' \
-                      '| valid loss {:5.2f}'.format(
-                train_step // args.eval_interval, train_step,
-                (time.time() - eval_start_time), val_loss)
-            if args.dataset in ['enwik8', 'text8']:
-                log_str += ' | bpc {:9.5f}'.format(val_loss / math.log(2))
-            else:
-                log_str += ' | valid ppl {:9.3f}'.format(math.exp(val_loss))
-            logging(log_str)
-            logging('-' * 100)
-            # Save the model if the validation loss is the best we've seen so far.
-            if not best_val_loss or val_loss < best_val_loss:
-                if not args.debug:
-                    with open(os.path.join(args.work_dir, 'model.pt'), 'wb') as f:
-                        torch.save(model, f)
-                    with open(os.path.join(args.work_dir, 'optimizer.pt'), 'wb') as f:
-                        torch.save(optimizer.state_dict(), f)
-                best_val_loss = val_loss
-
-            # dev-performance based learning rate annealing
-            if args.scheduler == 'dev_perf':
-                scheduler.step(val_loss)
-                if args.sample_softmax > 0:
-                    scheduler_sparse.step(val_loss)
-
-            eval_start_time = time.time()
-
-        if train_step == args.max_step:
-            break
-
-def train():
-    # Turn on training mode which enables dropout.
-    global train_step, train_loss, best_val_loss, eval_start_time, log_start_time
-    model.train()
-    if args.batch_chunk > 1:
-        mems = [tuple() for _ in range(args.batch_chunk)]
-    else:
-        mems = tuple()
-    train_iter = tr_iter.get_varlen_iter() if args.varlen else tr_iter
-    for batch, (data, target, seq_len) in enumerate(train_iter):
-        model.zero_grad()
-        if args.batch_chunk > 1:
-            data_chunks = torch.chunk(data, args.batch_chunk, 1)
-            target_chunks = torch.chunk(target, args.batch_chunk, 1)
-            for i in range(args.batch_chunk):
-                data_i = data_chunks[i].contiguous()
-                target_i = target_chunks[i].contiguous()
-                ret = para_model(data_i, target_i, *mems[i])
-                loss, mems[i] = ret[0], ret[1:]
-                loss = loss.float().mean().type_as(loss) / args.batch_chunk
-                if args.fp16:
-                    optimizer.backward(loss)
-                else:
-                    loss.backward()
-                train_loss += loss.float().item()
-        else:
-            ret = para_model(data, target, *mems)
+                ret = para_model(data, target, *mems)
             loss, mems = ret[0], ret[1:]
             loss = loss.float().mean().type_as(loss)
             if args.fp16:
@@ -752,7 +582,12 @@ def train():
             log_start_time = time.time()
 
         if train_step % args.eval_interval == 0:
-            val_loss = evaluate(va_iter)
+            if model.predict_root:
+                model.predict_root = False
+                val_loss = evaluate(va_iter)
+                model.predict_root = True
+            else:
+                val_loss = evaluate(va_iter)
             logging('-' * 100)
             log_str = '| Eval {:3d} at step {:>8d} | time: {:5.2f}s ' \
                       '| valid loss {:5.2f}'.format(
@@ -782,7 +617,7 @@ def train():
 
             eval_start_time = time.time()
 
-        if train_step == args.max_step:
+        if train_step == max_step:
             break
 
 # Loop over epochs.
@@ -796,10 +631,12 @@ eval_start_time = time.time()
 # At any point you can hit Ctrl + C to break out of training early.
 try:
     for epoch in itertools.count(start=1):
-        if args.sega:
-            train_sega()
+        if train_step<=args.cl_steps:
+            model.predict_root = True
+            train(tr_iter_cl, max_step=args.cl_steps)
         else:
-            train()
+            model.predict_root = False
+            train(tr_iter, max_step=args.max_step)
         if train_step == args.max_step:
             logging('-' * 100)
             logging('End of training')
@@ -807,6 +644,7 @@ try:
 except KeyboardInterrupt:
     logging('-' * 100)
     logging('Exiting from training early')
+    
 writer.flush()
 writer.close()
 # Load the best saved model.

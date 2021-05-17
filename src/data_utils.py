@@ -45,10 +45,10 @@ class LMOrderedIterator(object):
 
         data = self.data[beg_idx:end_idx]
         target = self.data[i+1:i+1+seq_len]
+        pst = tuple()
         if self.sega:
             pst = (self.p[beg_idx:end_idx], self.s[beg_idx:end_idx],self.t[beg_idx:end_idx])
-            return data, target, seq_len, pst
-        return data, target, seq_len
+        return data, target, seq_len, pst
 
     def get_fixlen_iter(self, start=0):
         for i in range(start, self.data.size(0) - 1, self.bptt):
@@ -189,7 +189,7 @@ class LMMultiFileIterator(LMShuffledIterator):
 
 
 class Corpus(object):
-    def __init__(self, path, dataset, sega, sent_eos, *args, **kwargs):
+    def __init__(self, path, dataset, sega, sent_eos, cl_vocab=False, *args, **kwargs):
         self.dataset = dataset
         if sega:
             self.vocab = SegaVocab(*args, **kwargs)
@@ -207,6 +207,9 @@ class Corpus(object):
             self.vocab.count_file(os.path.join(path, 'test.txt.raw'), sega=sega, sent_eos=sent_eos, char_level=True)
         elif self.dataset == 'wt103':
             self.vocab.count_file(os.path.join(path, 'train.txt'),sega=sega,sent_eos=sent_eos)
+            if cl_vocab:
+                self.vocab.count_cl_file(os.path.join(path, 'cl-train.txt'),sega=sega,sent_eos=sent_eos)
+
         elif self.dataset == 'lm1b':
             train_path_pattern = os.path.join(
                 path, '1-billion-word-language-modeling-benchmark-r13output',
@@ -217,7 +220,12 @@ class Corpus(object):
         self.vocab.build_vocab()
 
         if self.dataset in ['ptb', 'wt2', 'wt103']:
-            self.train = self.vocab.encode_file(
+            if cl_vocab:
+                self.train_cl = self.vocab.encode_file( 
+                os.path.join(path, 'cl-train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+            else:
+                self.train_cl = None
+            self.train = self.vocab.encode_file( 
                 os.path.join(path, 'train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
             self.valid = self.vocab.encode_file(
                 os.path.join(path, 'valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
@@ -250,11 +258,14 @@ class Corpus(object):
                 data_iter = LMOrderedIterator(data, *args, **kwargs)
             elif self.dataset == 'lm1b':
                 data_iter = LMShuffledIterator(data, *args, **kwargs)
-
+        elif split == 'train_cl':
+            data_iter = LMOrderedIterator(self.train_cl, *args, **kwargs)
         return data_iter
 
-def get_lm_corpus(datadir, dataset,sega=False,sent_eos=False):
+def get_lm_corpus(datadir, dataset,sega=False,sent_eos=False, cl_vocab=False):
     target_name = 'cache.pt'
+    if cl_vocab:
+        target_name = "cl_" + target_name
     if sega:
         target_name = 'sega_'+target_name
     if sent_eos:
@@ -280,6 +291,7 @@ def get_lm_corpus(datadir, dataset,sega=False,sent_eos=False):
             pass
         kwargs['sega'] = sega
         kwargs['sent_eos'] = sent_eos
+        kwargs['cl_vocab'] = cl_vocab
         corpus = Corpus(datadir, dataset, **kwargs)
         torch.save(corpus, fn)
 

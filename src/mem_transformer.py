@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.proj_adaptive_softmax import ProjectedAdaptiveLogSoftmax
+from utils.proj_adaptive_softmax import ProjectedAdaptiveLogSoftmax,ClassedProjectedAdaptiveLogSoftmax
 from utils.log_uniform_sampler import LogUniformSampler, sample_logits
 # from longformer.diagonaled_mm_tvm import diagonaled_mm as diagonaled_mm_tvm, mask_invalid_locations
 
@@ -684,7 +684,7 @@ class MemTransformerLM(nn.Module):
                  tgt_len=None, ext_len=None, mem_len=None, 
                  cutoffs=[], adapt_inp=False,
                  same_length=False, attn_type=0, clamp_len=-1, 
-                 sample_softmax=-1):
+                 sample_softmax=-1, cl_all_root_index=None, cl_all_leaf_index=None):
         super(MemTransformerLM, self).__init__()
         self.n_token = n_token
 
@@ -741,11 +741,17 @@ class MemTransformerLM(nn.Module):
                 self.out_layer.weight = self.word_emb.weight
             self.tie_weight = tie_weight
             self.sampler = LogUniformSampler(n_token, sample_softmax)
-
         # use adaptive softmax (including standard softmax)
         else:
-            self.crit = ProjectedAdaptiveLogSoftmax(n_token, d_embed, d_model, 
-                                                    cutoffs, div_val=div_val)
+            if not cl_all_root_index or not cl_all_leaf_index:
+
+                self.crit = ProjectedAdaptiveLogSoftmax(n_token, d_embed, d_model, 
+                                                        cutoffs, div_val=div_val)
+            else:
+                self.crit = ClassedProjectedAdaptiveLogSoftmax(n_token, d_embed, d_model, 
+                                                        cutoffs, div_val=div_val, 
+                                                        cl_all_root_index=cl_all_root_index, 
+                                                        cl_all_leaf_index=cl_all_leaf_index)
 
             if tie_weight:
                 for i in range(len(self.crit.out_layers)):
@@ -758,9 +764,9 @@ class MemTransformerLM(nn.Module):
                     elif tie_proj and div_val != 1:
                         self.crit.out_projs[i] = self.word_emb.emb_projs[i]
 
+        self.predict_root = False
         self.same_length = same_length
         self.clamp_len = clamp_len
-
         self._create_params()
 
     def backward_compatible(self):
@@ -936,7 +942,10 @@ class MemTransformerLM(nn.Module):
                 self.out_layer.bias, target, pred_hid, self.sampler)
             loss = -F.log_softmax(logit, -1)[:, :, 0]
         else:
-            loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)))
+            if self.predict_root:
+                loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)),predict_root=True)
+            else:
+                loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)))
             loss = loss.view(tgt_len, -1)
 
         if new_mems is None:

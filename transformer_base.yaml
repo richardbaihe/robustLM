@@ -1,12 +1,10 @@
 
 target:
-  service: aml
-  # run "pt target list amlk8s" to list the names of available AMLK8s targets
-  name: canada24
-  # name: canada24
+  # service: amlk8s
+  # name: itpscusv100cl
   # vc: resrchvc
-
-    
+  service: aml
+  name: canada24
 
 environment:
   image: nvidia/pytorch:20.12-py3
@@ -51,4 +49,25 @@ jobs:
     --batch_size 10
     --split test
     --cuda
+    --pt
+- name: train_cl
+  sku: G4
+  command:
+  - python train.py --dataset wt103
+    --n_layer 16
+    --d_model 410
+    --n_head 10
+    --d_head 41
+    --d_inner 2100
+    --tgt_len 150
+    --eval_tgt_len 150
+    --mem_len 0
+    --batch_size 64
+    --adaptive
+    --fp16
+    --dynamic-loss-scale
+    --multi_gpu
+    --cuda
+    --cl_softmax
+    --cl_steps 20000
     --pt

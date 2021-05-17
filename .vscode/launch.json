@@ -12,7 +12,7 @@
       "console": "integratedTerminal",
       "env": {
         "CUDA_VISIBLE_DEVICES":"2", 
-        "PYTHONPATH":"${workspaceFolder}",
+        "PYTHONPATH":"${workspaceFolder}/src",
         "LD_LIBRARY_PATH":"/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
       },
       "args" : [
@@ -26,18 +26,18 @@
       ]
     },
     {
-      "name": "train: cl-trans-base",
+      "name": "train: cl-base",
       "type": "python",
       "request": "launch",
-      "program": "${workspaceFolder}/train.py",
+      "program": "${workspaceFolder}/src/train.py",
       "console": "integratedTerminal",
       "env": {
         "CUDA_VISIBLE_DEVICES":"0,1,2,3", 
-        "PYTHONPATH":"${workspaceFolder}",
+        "PYTHONPATH":"${workspaceFolder}/src",
         "LD_LIBRARY_PATH":"/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
       },
       "args" : [
-        "--data", "/home/baihe/datasets/LM_data/CL/wikitext-103/",
+        "--data", "${workspaceFolder}/data/wikitext-103/",
         "--dataset", "wt103",
         "--cuda", 
         "--adaptive",
@@ -60,7 +60,9 @@
         "--fp16",
         "--dynamic-loss-scale",
         "--multi_gpu",
-        "--work_dir", "${workspaceFolder}/wiki103/cl/cl-trans-base-0503",
+        "--cl_softmax",
+        "--work_dir", "${workspaceFolder}/output/cl-base",
+        "--eval_interval", "1"
       ]
     },
   ]

@@ -14,6 +14,8 @@ class Vocab(object):
         self.lower_case = lower_case
         self.delimiter = delimiter
         self.vocab_file = vocab_file
+        self.cl_root_tokens = []
+        self.cl_leaf_tokens = []
 
     def tokenize(self, line, add_eos=False, add_double_eos=False, add_sent_eos=False,char_level=False):
         line = line.strip()
@@ -53,6 +55,23 @@ class Vocab(object):
                     symbols = self.tokenize(line, add_eos=add_eos,add_sent_eos=sent_eos,char_level=char_level)
                     self.counter.update(symbols)
 
+    def count_cl_file(self, path, verbose=False, add_eos=False, sega=False,sent_eos=False,char_level=False):
+        if verbose: print('counting cl file {} ...'.format(path))
+        if not os.path.exists(path):
+            print("found no cl files to count")
+            return
+        temp_counter = Counter()
+        with open(path, 'r', encoding='utf-8') as f:
+            for idx, line in enumerate(f):
+                if verbose and idx > 0 and idx % 500000 == 0:
+                    print('    line {}'.format(idx))
+                symbols = self.tokenize(line, add_eos=add_eos,add_sent_eos=sent_eos,char_level=char_level)
+                temp_counter.update(symbols)
+        self.cl_root_tokens = list((temp_counter-self.counter).keys())
+        self.cl_leaf_tokens = list((self.counter-temp_counter).keys())
+        self.counter = self.counter | temp_counter
+        
+
     def _build_from_file(self, vocab_file):
         self.idx2sym = []
         self.sym2idx = OrderedDict()
@@ -83,6 +102,9 @@ class Vocab(object):
 
             print('final vocab size {} from {} unique tokens'.format(
                 len(self), len(self.counter)))
+        if self.cl_root_tokens:
+            self.cl_root_tokens = [self.get_idx(sym) for sym in self.cl_root_tokens]
+            self.cl_leaf_tokens = [self.get_idx(sym) for sym in self.cl_leaf_tokens]
 
     def encode_file(self, path, ordered=False, verbose=False, add_eos=True,
             add_double_eos=False,add_sent_eos=False):

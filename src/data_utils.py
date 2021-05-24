@@ -189,7 +189,7 @@ class LMMultiFileIterator(LMShuffledIterator):
 
 
 class Corpus(object):
-    def __init__(self, path, dataset, sega, sent_eos, cl_vocab=False, *args, **kwargs):
+    def __init__(self, path, dataset, sega, sent_eos, *args, **kwargs):
         self.dataset = dataset
         if sega:
             self.vocab = SegaVocab(*args, **kwargs)
@@ -207,8 +207,6 @@ class Corpus(object):
             self.vocab.count_file(os.path.join(path, 'test.txt.raw'), sega=sega, sent_eos=sent_eos, char_level=True)
         elif self.dataset == 'wt103':
             self.vocab.count_file(os.path.join(path, 'train.txt'),sega=sega,sent_eos=sent_eos)
-            if cl_vocab:
-                self.vocab.count_cl_file(os.path.join(path, 'cl-train.txt'),sega=sega,sent_eos=sent_eos)
 
         elif self.dataset == 'lm1b':
             train_path_pattern = os.path.join(
@@ -220,11 +218,6 @@ class Corpus(object):
         self.vocab.build_vocab()
 
         if self.dataset in ['ptb', 'wt2', 'wt103']:
-            if cl_vocab:
-                self.train_cl = self.vocab.encode_file( 
-                os.path.join(path, 'cl-train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
-            else:
-                self.train_cl = None
             self.train = self.vocab.encode_file( 
                 os.path.join(path, 'train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
             self.valid = self.vocab.encode_file(
@@ -262,10 +255,8 @@ class Corpus(object):
             data_iter = LMOrderedIterator(self.train_cl, *args, **kwargs)
         return data_iter
 
-def get_lm_corpus(datadir, dataset,sega=False,sent_eos=False, cl_vocab=False):
+def get_lm_corpus(datadir, dataset,sega=False,sent_eos=False, mix_corpus=False):
     target_name = 'cache.pt'
-    if cl_vocab:
-        target_name = "cl_" + target_name
     if sega:
         target_name = 'sega_'+target_name
     if sent_eos:
@@ -291,8 +282,7 @@ def get_lm_corpus(datadir, dataset,sega=False,sent_eos=False, cl_vocab=False):
         pass
     kwargs['sega'] = sega
     kwargs['sent_eos'] = sent_eos
-    kwargs['cl_vocab'] = cl_vocab
-    if cl_vocab:
+    if mix_corpus:
         corpus = MixCorpus(datadir, dataset, **kwargs)
     else:
         corpus = Corpus(datadir, dataset, **kwargs)

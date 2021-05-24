@@ -1,181 +1,32 @@
 # coding: utf-8
-import argparse
 import time
 import math
 import os, sys
+import json
 import itertools
 import logging
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-from tensorboard.compat import tf
+import wandb
+
+from utils.arguments import get_args
 from data_utils import get_lm_corpus
 from mem_transformer import MemTransformerLM
 from utils.exp_utils import create_exp_dir
 from utils.data_parallel import BalancedDataParallel
 
-parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model')
-parser.add_argument('--data', type=str, default=os.getenv('PT_DATA_DIR', 'data'),
-                    help='location of the data corpus')
-parser.add_argument('--dataset', type=str, default='wt103',
-                    choices=['wt103', 'lm1b', 'enwik8', 'text8'],
-                    help='dataset name')
-parser.add_argument('--n_layer', type=int, default=12,
-                    help='number of total layers')
-parser.add_argument('--n_head', type=int, default=10,
-                    help='number of heads')
-parser.add_argument('--d_head', type=int, default=50,
-                    help='head dimension')
-parser.add_argument('--d_embed', type=int, default=-1,
-                    help='embedding dimension')
-parser.add_argument('--d_model', type=int, default=500,
-                    help='model dimension')
-parser.add_argument('--d_inner', type=int, default=1000,
-                    help='inner dimension in FF')
-parser.add_argument('--dropout', type=float, default=0.1,
-                    help='global dropout rate')
-parser.add_argument('--dropatt', type=float, default=0.0,
-                    help='attention probability dropout rate')
-parser.add_argument('--init', default='normal', type=str,
-                    help='parameter initializer to use.')
-parser.add_argument('--emb_init', default='normal', type=str,
-                    help='parameter initializer to use.')
-parser.add_argument('--init_range', type=float, default=0.1,
-                    help='parameters initialized by U(-init_range, init_range)')
-parser.add_argument('--emb_init_range', type=float, default=0.01,
-                    help='parameters initialized by U(-init_range, init_range)')
-parser.add_argument('--init_std', type=float, default=0.02,
-                    help='parameters initialized by N(0, init_std)')
-parser.add_argument('--proj_init_std', type=float, default=0.01,
-                    help='parameters initialized by N(0, init_std)')
-parser.add_argument('--optim', default='adam', type=str,
-                    choices=['adam', 'sgd', 'adagrad'],
-                    help='optimizer to use.')
-parser.add_argument('--lr', type=float, default=0.00025,
-                    help='initial learning rate (0.00025|5 for adam|sgd)')
-parser.add_argument('--mom', type=float, default=0.0,
-                    help='momentum for sgd')
-parser.add_argument('--scheduler', default='cosine', type=str,
-                    choices=['cosine', 'inv_sqrt', 'dev_perf', 'constant'],
-                    help='lr scheduler to use.')
-parser.add_argument('--warmup_step', type=int, default=0,
-                    help='upper epoch limit')
-parser.add_argument('--decay_rate', type=float, default=0.5,
-                    help='decay factor when ReduceLROnPlateau is used')
-parser.add_argument('--lr_min', type=float, default=0.0,
-                    help='minimum learning rate during annealing')
-parser.add_argument('--clip', type=float, default=0.25,
-                    help='gradient clipping')
-parser.add_argument('--clip_nonemb', action='store_true',
-                    help='only clip the gradient of non-embedding params')
-parser.add_argument('--max_step', type=int, default=100000,
-                    help='upper epoch limit')
-parser.add_argument('--batch_size', type=int, default=60,
-                    help='batch size')
-parser.add_argument('--batch_chunk', type=int, default=1,
-                    help='split batch into chunks to save memory')
-parser.add_argument('--tgt_len', type=int, default=70,
-                    help='number of tokens to predict')
-parser.add_argument('--eval_tgt_len', type=int, default=50,
-                    help='number of tokens to predict for evaluation')
-parser.add_argument('--ext_len', type=int, default=0,
-                    help='length of the extended context')
-parser.add_argument('--mem_len', type=int, default=0,
-                    help='length of the retained previous heads')
-parser.add_argument('--not_tied', action='store_true',
-                    help='do not tie the word embedding and softmax weights')
-parser.add_argument('--seed', type=int, default=1111,
-                    help='random seed')
-parser.add_argument('--window_size', type=int, default=0,
-                    help='local attention window size')
-parser.add_argument('--sparse_mode', type=str, default='none',
-                    help='spare mode for longformer')
-parser.add_argument('--cuda', action='store_true',
-                    help='use CUDA')
-parser.add_argument('--sega', action='store_true',
-                    help='sega or not')
-parser.add_argument('--adaptive', action='store_true',
-                    help='use adaptive softmax')
-parser.add_argument('--div_val', type=int, default=1,
-                    help='divident value for adapative input and softmax')
-parser.add_argument('--pre_lnorm', action='store_true',
-                    help='apply LayerNorm to the input instead of the output')
-parser.add_argument('--varlen', action='store_true',
-                    help='use variable length')
-parser.add_argument('--multi_gpu', action='store_true',
-                    help='use multiple GPU')
-parser.add_argument('--log_interval', type=int, default=200,
-                    help='report interval')
-parser.add_argument('--eval_interval', type=int, default=4000,
-                    help='evaluation interval')
-parser.add_argument('--work_dir', default='LM-TFM', type=str,
-                    help='experiment directory.')
-parser.add_argument('--restart', action='store_true',
-                    help='restart training from the saved checkpoint')
-parser.add_argument('--restart_dir', type=str, default='',
-                    help='restart dir')
-parser.add_argument('--debug', action='store_true',
-                    help='run in debug mode (do not create exp dir)')
-parser.add_argument('--same_length', action='store_true',
-                    help='use the same attn length for all tokens')
-parser.add_argument('--attn_type', type=int, default=0,
-                    help='attention type. 0 for ours, 1 for Shaw et al,'
-                    '2 for Vaswani et al, 3 for Al Rfou et al.')
-parser.add_argument('--clamp_len', type=int, default=-1,
-                    help='use the same pos embeddings after clamp_len')
-parser.add_argument('--eta_min', type=float, default=0.0,
-                    help='min learning rate for cosine scheduler')
-parser.add_argument('--gpu0_bsz', type=int, default=-1,
-                    help='batch size on gpu 0')
-parser.add_argument('--max_eval_steps', type=int, default=-1,
-                    help='max eval steps')
-parser.add_argument('--sample_softmax', type=int, default=-1,
-                    help='number of samples in sampled softmax')
-parser.add_argument('--patience', type=int, default=0,
-                    help='patience')
-parser.add_argument('--finetune_v2', action='store_true',
-                    help='finetune v2')
-parser.add_argument('--finetune_v3', action='store_true',
-                    help='finetune v3')
-parser.add_argument('--fp16', action='store_true',
-                    help='Run in pseudo-fp16 mode (fp16 storage fp32 math).')
-parser.add_argument('--static-loss-scale', type=float, default=1,
-                    help='Static loss scale, positive power of 2 values can '
-                    'improve fp16 convergence.')
-parser.add_argument('--dynamic-loss-scale', action='store_true',
-                    help='Use dynamic loss scaling.  If supplied, this argument'
-                    ' supersedes --static-loss-scale.')
-parser.add_argument('--cl_softmax', action='store_true',
-                    help='vocab contain classes or not')
-parser.add_argument('--cl_steps', type=int, default=0,
-                    help='initial steps for classLM training')
-parser.add_argument('--cl_annealing', type=float, default=0,
-                    help='initial cl portion for mix training')
-parser.add_argument('--pt', action='store_true',
-                    help='phillytool or local')
-args = parser.parse_args()
+def wandb_init(args):
+    wandb_config = json.load(open('wandb_config.json','r'))
+    os.environ['WANDB_API_KEY'] = wandb_config['WANDB_API_KEY']
+    os.environ['WANDB_ENTITY'] = wandb_config['WANDB_ENTITY']
+    os.environ['WANDB_PROJECT'] = wandb_config['WANDB_PROJECT']
+    wandb.init(config=args,name=args.job_name)
 
-args.tied = not args.not_tied
-
-if args.d_embed < 0:
-    args.d_embed = args.d_model
-args.sent_eos=False
-if 'eos' in args.sparse_mode:
-    args.sent_eos=True
-
-assert args.ext_len >= 0, 'extended context length must be non-negative'
-assert args.batch_size % args.batch_chunk == 0
-
-if args.pt:
-    # this hack is required to enable `pt monitor` *while the job is running*.
-    delattr(tf.io.gfile.LocalFileSystem, 'append')
-    args.work_dir = os.environ.get('PT_OUTPUT_DIR', '.')
-else:
-    # args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
-    args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d'))
+args = get_args()
+wandb_init(args)
 logging = create_exp_dir(args.work_dir, debug=args.debug)
 writer = SummaryWriter(args.work_dir, flush_secs=30)
 
@@ -205,7 +56,7 @@ device = torch.device('cuda' if args.cuda else 'cpu')
 ###############################################################################
 # Load data
 ###############################################################################
-corpus = get_lm_corpus(args.data, args.dataset, sega=args.sega, sent_eos=args.sent_eos, cl_vocab=args.cl_softmax)
+corpus = get_lm_corpus(args.data, args.dataset, sega=args.sega, sent_eos=args.sent_eos, mix_corpus=args.mix_corpus)
 cl_all_root_index = corpus.vocab.cl_root_tokens 
 cl_all_leaf_index = corpus.vocab.cl_leaf_tokens 
 ntokens = len(corpus.vocab)
@@ -584,6 +435,7 @@ def train(data_iter, max_step):
             logging(log_str)
             train_loss = 0
             log_start_time = time.time()
+            wandb.log({"train/loss": cur_loss,"step":train_step})
 
         if train_step % args.eval_interval == 0:
             model.predict_root = False
@@ -600,6 +452,7 @@ def train(data_iter, max_step):
                 writer.add_scalar("PPL/valid", math.exp(val_loss), train_step)
             logging(log_str)
             logging('-' * 100)
+            wandb.log({"valid/ppl": math.exp(val_loss),"step":train_step})
             # Save the model if the validation loss is the best we've seen so far.
             if not best_val_loss or val_loss < best_val_loss:
                 if not args.debug:
@@ -640,8 +493,8 @@ try:
                 cl_portion = 0
                 tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len, device=device, ext_len=args.ext_len, cl_portion=cl_portion)
                 train(tr_iter, max_step=args.max_step)
-        elif args.cl_annealing:
-            cl_portion = max(0, 0.8 - train_step/args.max_step)
+        elif args.cl_annealing>0:
+            cl_portion = max(0, args.cl_annealing - train_step/args.max_step)
             tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len, device=device, ext_len=args.ext_len, cl_portion=cl_portion)
             train(tr_iter, max_step=args.max_step)
         else:

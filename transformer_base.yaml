@@ -1,16 +1,16 @@
-
 target:
-  # service: amlk8s
-  # name: itpscusv100cl
-  # vc: resrchvc
-  service: aml
-  name: canada24
+  service: amlk8s
+  name: itpmtlv100cl1
+  vc: MSRMTLVC1
+  # service: aml
+  # name: canada24
 
 environment:
-  image: nvidia/pytorch:20.12-py3
-  registry: nvcr.io
+  # image: nvidia/pytorch:20.12-py3
+  # registry: nvcr.io
+  image: richardbaihe/pytorch:azure
   setup:
-    - pip install tensorboard --user
+    - source setup.sh
 
 code:
   local_dir: $CONFIG_DIR/src
@@ -68,6 +68,7 @@ jobs:
     --dynamic-loss-scale
     --multi_gpu
     --cuda
-    --cl_softmax
-    --cl_steps 20000
+    --mix_corpus
+    --cl_annealing 0.4
     --pt
+    --job_name trans_small_mix_0.4

@@ -696,7 +696,7 @@ class MemTransformerLM(nn.Module):
 
         self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs, 
                                           div_val=div_val)
-
+        
         self.drop = nn.Dropout(dropout)
 
         self.n_layer = n_layer
@@ -925,7 +925,7 @@ class MemTransformerLM(nn.Module):
 
         return core_out, new_mems
 
-    def forward(self, data, target, *mems):
+    def forward(self, data, target, mems, predict_root=False,):
         # nn.DataParallel does not allow size(0) tensors to be broadcasted.
         # So, have to initialize size(0) mems inside the model forward.
         # Moreover, have to return new_mems to allow nn.DataParallel to piece
@@ -942,7 +942,7 @@ class MemTransformerLM(nn.Module):
                 self.out_layer.bias, target, pred_hid, self.sampler)
             loss = -F.log_softmax(logit, -1)[:, :, 0]
         else:
-            if self.predict_root:
+            if predict_root:
                 loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)),predict_root=True)
             else:
                 loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)))

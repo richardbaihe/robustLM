@@ -1,6 +1,6 @@
 import os, sys
 import glob
-
+import mpu
 from collections import Counter, OrderedDict
 import numpy as np
 import torch
@@ -255,48 +255,56 @@ class Corpus(object):
             data_iter = LMOrderedIterator(self.train_cl, *args, **kwargs)
         return data_iter
 
-def get_lm_corpus(datadir, dataset,sega=False,sent_eos=False, mix_corpus=False):
-    target_name = 'cache.pt'
-    if sega:
-        target_name = 'sega_'+target_name
-    if sent_eos:
-        target_name = 'eos_'+target_name
-    fn = os.path.join(datadir, target_name)
-    # if os.path.exists(fn):
-    #     print('Loading cached dataset...')
-    #     corpus = torch.load(fn)
-    # else:
-    print('Producing dataset {}...'.format(dataset))
-    kwargs = {}
-    if dataset in ['wt103', 'wt2']:
-        kwargs['special'] = ['<eos>','<sent_eos>']
-        kwargs['lower_case'] = False
-    elif dataset == 'ptb':
-        kwargs['special'] = ['<eos>']
-        kwargs['lower_case'] = True
-    elif dataset == 'lm1b':
-        kwargs['special'] = []
-        kwargs['lower_case'] = False
-        kwargs['vocab_file'] = os.path.join(datadir, '1b_word_vocab.txt')
-    elif dataset in ['enwik8', 'text8']:
-        pass
-    kwargs['sega'] = sega
-    kwargs['sent_eos'] = sent_eos
-    if mix_corpus:
-        corpus = MixCorpus(datadir, dataset, **kwargs)
+def get_lm_corpus(args):
+    corpus = None
+    if mpu.get_model_parallel_rank() == 0:
+        print('Producing dataset {} with rank {}'.format(args.dataset, args.rank))
+        kwargs = {}
+        if args.dataset in ['wt103']:
+            kwargs['special'] = ['<eos>','<sent_eos>']
+            kwargs['lower_case'] = False
+        else:
+            raise NotImplementedError
+        fn = os.path.join(args.data, 'cache.pt')
+        if os.path.exists(fn):
+            print('Loading cached dataset...')
+            corpus = torch.load(fn)
+        else:
+            corpus = MixCorpus(args, **kwargs)
+            torch.save(corpus, fn)
+        ntokens = torch.cuda.LongTensor([len(corpus.vocab)])
+        cl_root_tokens = torch.cuda.LongTensor(corpus.vocab.cl_root_tokens)
+        cl_leaf_tokens = torch.cuda.LongTensor(corpus.vocab.cl_leaf_tokens)
     else:
-        corpus = Corpus(datadir, dataset, **kwargs)
-        # torch.save(corpus, fn)
+        ntokens = torch.cuda.LongTensor([0])
+        cl_root_tokens = torch.cuda.LongTensor([0])
+        cl_leaf_tokens = torch.cuda.LongTensor([0])
+    
+    torch.distributed.broadcast(ntokens, mpu.get_model_parallel_src_rank(),
+                                group=mpu.get_data_parallel_group())
+    torch.distributed.broadcast(cl_root_tokens, mpu.get_model_parallel_src_rank(),
+                                group=mpu.get_data_parallel_group())
+    torch.distributed.broadcast(cl_leaf_tokens, mpu.get_model_parallel_src_rank(),
+                                group=mpu.get_data_parallel_group())
 
+    args.n_token = ntokens.item()
+    args.cl_all_root_index = cl_root_tokens.tolist()
+    args.cl_all_leaf_index =  cl_leaf_tokens.tolist()
+    
     return corpus
 
 
 class MixLMOrderedIterator(LMOrderedIterator):
-    def __init__(self, data, data_cl, bsz, bptt, device='cpu', ext_len=None, cl_portion=0):
+    def __init__(self, data, data_cl, bsz, bptt, device='cpu', ext_len=None, cl_portion=0, rank=-1, world_size=1):
         """
             data -- LongTensor -- the LongTensor is strictly ordered
         """
-        self.bsz = bsz
+        if rank == -1:
+            assert False, 'should not be here'
+            rank = torch.distributed.get_rank()
+        self.rank = rank
+        self.world_size = world_size
+        self.bsz = bsz*self.world_size
         self.bptt = bptt
         self.ext_len = ext_len if ext_len is not None else 0
         self.sega =  isinstance(data, tuple)
@@ -306,75 +314,78 @@ class MixLMOrderedIterator(LMOrderedIterator):
             data,p,s,t = data
         assert data.size(0) == data_cl.size(0)
         # Work out how cleanly we can divide the dataset into bsz parts.
-        self.n_step = data.size(0) // bsz
+        self.n_step = data.size(0) // self.bsz
 
         # Trim off any extra elements that wouldn't cleanly fit (remainders).
-        data = data.narrow(0, 0, self.n_step * bsz)
+        data = data.narrow(0, 0, self.n_step * self.bsz)
         # Evenly divide the data across the bsz batches.
-        self.data = data.view(bsz, -1).t().contiguous().to(device)
-        data_cl = data_cl.narrow(0,0,self.n_step*bsz)
-        self.data_cl = data_cl.view(bsz, -1).t().contiguous().to(device)
-        if self.sega:
-            p = p.narrow(0, 0, self.n_step * bsz)
-            s = s.narrow(0, 0, self.n_step * bsz)
-            t = t.narrow(0, 0, self.n_step * bsz)
-            self.p = p.view(bsz, -1).t().contiguous().to(device)
-            self.s = s.view(bsz, -1).t().contiguous().to(device)
-            self.t = t.view(bsz, -1).t().contiguous().to(device)
+        self.data = data.view(self.bsz, -1).t().contiguous().to(device)
+        data_cl = data_cl.narrow(0,0,self.n_step*self.bsz)
+        self.data_cl = data_cl.view(self.bsz, -1).t().contiguous().to(device)
+        # if self.sega:
+        #     p = p.narrow(0, 0, self.n_step * bsz)
+        #     s = s.narrow(0, 0, self.n_step * bsz)
+        #     t = t.narrow(0, 0, self.n_step * bsz)
+        #     self.p = p.view(bsz, -1).t().contiguous().to(device)
+        #     self.s = s.view(bsz, -1).t().contiguous().to(device)
+        #     self.t = t.view(bsz, -1).t().contiguous().to(device)
         # Number of mini-batches
         self.n_batch = (self.n_step + self.bptt - 1) // self.bptt
+    
 
-    def get_batch(self, i, bptt=None):
-        random_number = np.random.randint(1,101)
-        if random_number<=self.cl_portion:
-            cl = True
-        else:
-            cl = False
-        if bptt is None: bptt = self.bptt
-        seq_len = min(bptt, self.data.size(0) - 1 - i)
-
+    def get_batch(self, i):
+        #if bptt is None: bptt = self.bptt
+        i = i%self.n_batch
+        seq_len = min(self.bptt, self.data.size(0) - 1 - i)
+        # while i+seq_len >= self.data.size(0):
+        #     i = max(0, i-self.data.size(0))
         end_idx = i + seq_len
         beg_idx = max(0, i - self.ext_len)
-        if cl:
-            data = self.data_cl[beg_idx:end_idx]
-            target = self.data_cl[i+1:i+1+seq_len]
-        else:
-            data = self.data[beg_idx:end_idx]
-            target = self.data[i+1:i+1+seq_len]
-        pst = tuple()
-        if self.sega:
-            pst = (self.p[beg_idx:end_idx], self.s[beg_idx:end_idx],self.t[beg_idx:end_idx])
-        return data, target, seq_len, pst, cl
+        start = self.rank*self.bsz//self.world_size
+        end = (self.rank+1)*self.bsz//self.world_size
+        data = self.data[beg_idx:end_idx, start:end]
+        target = self.data[i+1:i+1+seq_len, start:end]
+
+        cl_data = self.data_cl[beg_idx:end_idx, start:end]
+        cl_target = self.data_cl[i+1:i+1+seq_len, start:end]
+        # pst = tuple()
+        # if self.sega:
+        #     pst = (self.p[beg_idx:end_idx], self.s[beg_idx:end_idx],self.t[beg_idx:end_idx])
+        # return data, target, cl_data, cl_target
+        return {'input':data, 'target':target, 'cl_input':cl_data, 'cl_target':cl_target}
 
     def get_fixlen_iter(self, start=0):
         for i in range(start, self.data.size(0) - 1, self.bptt):
             yield self.get_batch(i)
 
-    def get_varlen_iter(self, start=0, std=5, min_len=5, max_deviation=3):
-        max_len = self.bptt + max_deviation * std
-        i = start
-        while True:
-            bptt = self.bptt if np.random.random() < 0.95 else self.bptt / 2.
-            bptt = min(max_len, max(min_len, int(np.random.normal(bptt, std))))
-            if self.sega:
-                data, target, seq_len, pst = self.get_batch(i, bptt)
-                i += seq_len
-                yield data, target, seq_len, pst
-            else:
-                data, target, seq_len = self.get_batch(i, bptt)
-                i += seq_len
-                yield data, target, seq_len
-            if i >= self.data.size(0) - 2:
-                break
+    # def get_varlen_iter(self, start=0, std=5, min_len=5, max_deviation=3):
+    #     max_len = self.bptt + max_deviation * std
+    #     i = start
+    #     while True:
+    #         bptt = self.bptt if np.random.random() < 0.95 else self.bptt / 2.
+    #         bptt = min(max_len, max(min_len, int(np.random.normal(bptt, std))))
+    #         if self.sega:
+    #             data, target, seq_len, pst = self.get_batch(i, bptt)
+    #             i += seq_len
+    #             yield data, target, seq_len, pst
+    #         else:
+    #             data, target, seq_len = self.get_batch(i, bptt)
+    #             i += seq_len
+    #             yield data, target, seq_len
+    #         if i >= self.data.size(0) - 2:
+    #             break
 
     def __iter__(self):
         return self.get_fixlen_iter()
 
+    def __len__(self):
+        return self.n_batch
 
 class MixCorpus(object):
-    def __init__(self, path, dataset, sega, sent_eos, cl_vocab=False, *args, **kwargs):
+    def __init__(self, args, *_args, **kwargs):
+        path, dataset, sega, sent_eos = args.data, args.dataset, args.sega, args.sent_eos
         self.dataset = dataset
-        self.vocab = Vocab(*args, **kwargs)
+        self.vocab = Vocab(*_args, **kwargs)
         self.add_sent_eos = sent_eos
 
         self.vocab.count_file(os.path.join(path, 'train.txt'),sega=sega,sent_eos=sent_eos)
@@ -385,17 +396,30 @@ class MixCorpus(object):
         os.path.join(path, 'cl-train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
         self.train = self.vocab.encode_file( 
             os.path.join(path, 'train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        # self.train = self.train[args.rank*(self.train.size(0)//args.world_size): (args.rank+1)*(self.train.size(0)//args.world_size)]
+        # self.train_cl = self.train_cl[args.rank*(self.train_cl.size(0)//args.world_size): (args.rank+1)*(self.train_cl.size(0)//args.world_size)]
         self.valid = self.vocab.encode_file(
             os.path.join(path, 'valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        self.valid_cl = self.vocab.encode_file( 
+        os.path.join(path, 'cl-valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
         self.test = self.vocab.encode_file(
             os.path.join(path, 'test.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        self.test_cl = self.vocab.encode_file( 
+        os.path.join(path, 'cl-test.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
 
     def get_iterator(self, split, *args, **kwargs):
         if split == 'train':
-            data_iter = MixLMOrderedIterator(self.train,self.train_cl, *args, **kwargs)
-        elif split in ['valid', 'test']:
+            data = self.train
+            data_cl = self.train_cl
+        else:
             data = self.valid if split == 'valid' else self.test
-            data_iter = LMOrderedIterator(data, *args, **kwargs)
+            data_cl = self.valid_cl if split == 'valid' else self.test_cl
+        data_iter = MixLMOrderedIterator(data, data_cl, *args, **kwargs)
+        # if split == 'train':
+        #     data_iter = MixLMOrderedIterator(self.train, self.train_cl, *args, **kwargs)
+        # elif split in ['valid', 'test']:
+        #     data = self.valid if split == 'valid' else self.test
+        #     data_iter = LMOrderedIterator(data, *args, **kwargs)
         return data_iter
 
 if __name__ == '__main__':

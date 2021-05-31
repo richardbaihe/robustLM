@@ -55,6 +55,10 @@ def add_training_config_args(parser):
                         help='report interval')
     group.add_argument('--eval_interval', type=int, default=4000,
                         help='evaluation interval')
+    group.add_argument('--save_interval', type=int, default=5000,
+                        help='evaluation interval')
+    group.add_argument('--load_lastest', action='store_true',
+                        help='continue training from lastest checkpoint')                
     group.add_argument('--optim', default='adam', type=str,
                         choices=['adam', 'sgd', 'adagrad'],
                         help='optimizer to use.')
@@ -110,6 +114,25 @@ def add_training_config_args(parser):
                         help='finetune v3')
     parser.add_argument('--sega', action='store_true',
                         help='sega or not')
+    
+    # distributed training args
+    group.add_argument('--distributed-backend', default='nccl',
+                       help='which backend to use for distributed '
+                       'training. One of [gloo, nccl]')
+    group.add_argument('--DDP-impl', default='local',
+                       help='which DistributedDataParallel implementation '
+                       'to use. One of [local, torch]')
+    group.add_argument('--local_rank', type=int, default=None,
+                       help='local rank passed from distributed launcher')
+    group.add_argument('--model-parallel-size', type=int, default=1,
+                       help='size of the model parallel.')
+    # autoresume
+    group.add_argument('--adlr-autoresume', action='store_true',
+                       help='enable autoresume on adlr cluster.')
+    group.add_argument('--adlr-autoresume-interval', type=int, default=1000,
+                       help='intervals over which check for autoresume'
+                       'termination signal')
+
     return parser
 
 def add_evaluation_config_args(parser):
@@ -129,6 +152,10 @@ def add_data_config_args(parser):
     group.add_argument('--dataset', type=str, default='wt103',
                         choices=['wt103', 'lm1b', 'enwik8', 'text8'],
                         help='dataset name')
+    group.add_argument('--do_train', action='store_true',
+                        help='train model')
+    group.add_argument('--do_test', action='store_true',
+                        help='test model')
     return parser
 
 def add_device_config_args(parser):
@@ -151,6 +178,8 @@ def add_device_config_args(parser):
                         help='experiment directory.')
     group.add_argument('--job_name', default='example', type=str,
                         help='experimetn name')
+    group.add_argument('--wandb_offline', action='store_true',
+                        help='debugging offline')
     return parser
 
 def add_classLM_config_args(parser):
@@ -179,7 +208,8 @@ def get_args():
     parser = add_classLM_config_args(parser)
 
     args = parser.parse_args()
-
+    args.rank = int(os.getenv('RANK', '0'))
+    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
     args.tied = not args.not_tied
     args.sent_eos=False
     # if 'eos' in args.sparse_mode:

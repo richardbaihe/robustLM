@@ -188,8 +188,12 @@ def add_classLM_config_args(parser):
                         help='initial steps for classLM training')
     group.add_argument('--cl_annealing', type=float, default=0,
                         help='initial cl portion for mix training')
-    group.add_argument('--mix_corpus', action='store_true',
-                        help='process two corpus and mix them for class LM training')
+    # group.add_argument('--mix_corpus', action='store_true',
+    #                     help='process two corpus and mix them for class LM training')
+    group.add_argument('--input_root', action='store_true',
+                    help='when doing class-lm, whether inputs text contains class symbols (root) or normal words (leaf)')
+    group.add_argument('--multi_obj', action='store_true',
+                    help='multi objective')
     return parser
 
 def get_args():

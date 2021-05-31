@@ -677,6 +677,14 @@ class AdaptiveEmbedding(nn.Module):
 
         return embed
 
+def get_ith_embed_layer_given_index(index, word_emb):
+    for i in range(len(word_emb.cutoffs)):
+        l_idx, r_idx = word_emb.cutoff_ends[i], word_emb.cutoff_ends[i + 1]
+        if index >= l_idx and index < r_idx:
+            new_index = index-l_idx
+            return i, new_index
+    return -1, -1
+
 class MemTransformerLM(nn.Module):
     def __init__(self, n_token, n_layer, n_head, d_model, d_head, d_inner,
                  dropout, dropatt, tie_weight=True, d_embed=None, 
@@ -696,7 +704,8 @@ class MemTransformerLM(nn.Module):
 
         self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs, 
                                           div_val=div_val)
-        
+        self.auxilary_output_layer = nn.Linear(d_model, len(cl_all_root_index))
+        self.cl_root_vocab = {}
         self.drop = nn.Dropout(dropout)
 
         self.n_layer = n_layer
@@ -752,10 +761,16 @@ class MemTransformerLM(nn.Module):
                                                         cutoffs, div_val=div_val, 
                                                         cl_all_root_index=cl_all_root_index, 
                                                         cl_all_leaf_index=cl_all_leaf_index)
-
+                self.cl_root_vocab = {old_idx:new_idx for new_idx, old_idx in enumerate(cl_all_root_index)}
             if tie_weight:
                 for i in range(len(self.crit.out_layers)):
                     self.crit.out_layers[i].weight = self.word_emb.emb_layers[i].weight
+                # if self.cl_root_vocab:
+                #     with torch.no_grad():
+                #             # i, new_k = get_ith_embed_layer_given_index(k, self.word_emb)
+                #             # assert i>=0, "Error when building root embedding"
+                #         indices = torch.tensor(cl_all_root_index)
+                #         self.auxilary_output_layer.weight = self.word_emb.emb_layers[0].weight.index_select(0, indices)
 
             if tie_projs:
                 for i, tie_proj in enumerate(tie_projs):
@@ -925,33 +940,50 @@ class MemTransformerLM(nn.Module):
 
         return core_out, new_mems
 
-    def forward(self, data, target, mems, predict_root=False,):
+    def forward(self, leaf_data, leaf_target, root_data, root_target, mems, predict_root=False, input_root=False ):
         # nn.DataParallel does not allow size(0) tensors to be broadcasted.
         # So, have to initialize size(0) mems inside the model forward.
         # Moreover, have to return new_mems to allow nn.DataParallel to piece
         # them together.
         if not mems: mems = self.init_mems()
 
+        data = root_data if input_root else leaf_data
+        target = root_target if input_root else leaf_target        
+
         tgt_len = target.size(0)
         hidden, new_mems = self._forward(data, mems=mems)
 
         pred_hid = hidden[-tgt_len:]
-        if self.sample_softmax > 0 and self.training:
-            assert self.tie_weight
-            logit = sample_logits(self.word_emb,
-                self.out_layer.bias, target, pred_hid, self.sampler)
-            loss = -F.log_softmax(logit, -1)[:, :, 0]
-        else:
-            if predict_root:
-                loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)),predict_root=True)
-            else:
-                loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)))
-            loss = loss.view(tgt_len, -1)
 
-        if new_mems is None:
-            return [loss]
+        auxilary_loss = []
+        if predict_root and not input_root:
+            indices = torch.reshape((leaf_target!=root_target),(-1,)).nonzero().squeeze()
+            root_hidden_state = torch.reshape(pred_hid,(-1, pred_hid.size(-1))).index_select(0, indices)
+            root_logits = self.crit._compute_logit(root_hidden_state, 
+                            self.word_emb.emb_layers[0].weight.index_select(0, torch.tensor(list(self.cl_root_vocab.keys()),device=hidden.device)),
+                            self.auxilary_output_layer.bias, proj=None)
+            #root_logits = self.auxilary_output_layer(root_hidden_state)
+            selected_root_target = torch.reshape(root_target,(-1,)).index_select(0,indices)
+            auxilary_target = torch.tensor([self.cl_root_vocab[x] for x in selected_root_target.tolist()],device=selected_root_target.device)
+            auxilary_loss = -F.log_softmax(root_logits, dim=1).gather(1, auxilary_target.unsqueeze(1)).squeeze(1)
+            loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,))) 
+        elif predict_root and input_root:
+            loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)),predict_root=True)
         else:
-            return [loss] + new_mems
+            loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,))) 
+
+
+        # if predict_root:
+        #     loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)),predict_root=True)
+        # else:
+        #     loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)))
+        loss = loss.view(tgt_len, -1)
+        if len(auxilary_loss) == 0:
+            auxilary_loss = torch.zeros_like(loss)
+        if new_mems is None:
+            return [loss, auxilary_loss]
+        else:
+            return [loss, auxilary_loss] + new_mems
 
 class SegaMemTransformerLM(nn.Module):
     def __init__(self, n_token, n_layer, n_head, d_model, d_head, d_inner,

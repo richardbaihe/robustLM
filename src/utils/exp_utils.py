@@ -64,16 +64,17 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, args, best):
         ensure_directory_exists(checkpoint_name)
         torch.save(sd, checkpoint_name)
         print('  successfully saved {}'.format(checkpoint_name))
-
-    # Wait so everyone is done (necessary)
-    torch.distributed.barrier()
+    if not best:
+        # Wait so everyone is done (necessary)
+        torch.distributed.barrier()
     # And update the latest iteration
     if torch.distributed.get_rank() == 0 and not best:
         tracker_filename = get_checkpoint_tracker_filename(args.work_dir)
         with open(tracker_filename, 'w') as f:
             f.write(str(iteration))
-    # Wait so everyone is done (not necessary)
-    torch.distributed.barrier()
+    if not best:
+        # Wait so everyone is done (not necessary)
+        torch.distributed.barrier()
 
 def load_checkpoint(model, optimizer, lr_scheduler, args, best=False):
     """Load a model checkpoint."""

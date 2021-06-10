@@ -67,7 +67,7 @@ def add_training_config_args(parser):
     group.add_argument('--mom', type=float, default=0.0,
                         help='momentum for sgd')
     group.add_argument('--scheduler', default='cosine', type=str,
-                        choices=['cosine', 'inv_sqrt', 'dev_perf', 'constant'],
+                        choices=['cosine', 'linear', 'None', 'constant'],
                         help='lr scheduler to use.')
     group.add_argument('--warmup_step', type=int, default=0,
                         help='upper epoch limit')
@@ -119,7 +119,7 @@ def add_training_config_args(parser):
     group.add_argument('--distributed-backend', default='nccl',
                        help='which backend to use for distributed '
                        'training. One of [gloo, nccl]')
-    group.add_argument('--DDP-impl', default='local',
+    group.add_argument('--DDP-impl', default='torch',
                        help='which DistributedDataParallel implementation '
                        'to use. One of [local, torch]')
     group.add_argument('--local_rank', type=int, default=None,
@@ -143,6 +143,8 @@ def add_evaluation_config_args(parser):
                         help='max eval steps')
     group.add_argument('--sample_softmax', type=int, default=-1,
                         help='number of samples in sampled softmax')
+    group.add_argument('--checkpoint_dir', type=str, default="",
+                        help='directory of checkpoint files')
     return parser
 
 def add_data_config_args(parser):
@@ -156,6 +158,8 @@ def add_data_config_args(parser):
                         help='train model')
     group.add_argument('--do_test', action='store_true',
                         help='test model')
+    group.add_argument('--do_eval', action='store_true',
+                        help='eval model')
     return parser
 
 def add_device_config_args(parser):
@@ -194,6 +198,10 @@ def add_classLM_config_args(parser):
                     help='when doing class-lm, whether inputs text contains class symbols (root) or normal words (leaf)')
     group.add_argument('--multi_obj', action='store_true',
                     help='multi objective')
+    group.add_argument('--multi_obj_layer', type=int, default=-1,
+                    help='which layer do multi objective prediction')
+    group.add_argument('--mix_vocab', action='store_true',
+                    help='predict class label and general words together in a mixed vocab')
     return parser
 
 def get_args():

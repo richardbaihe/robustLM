@@ -704,6 +704,7 @@ class MemTransformerLM(nn.Module):
 
         self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs, 
                                           div_val=div_val)
+        self.auxilary_projection_layer = nn.Linear(d_model, d_model)
         self.auxilary_output_layer = nn.Linear(d_model, len(cl_all_root_index))
         self.cl_root_vocab = {}
         self.drop = nn.Dropout(dropout)
@@ -938,48 +939,59 @@ class MemTransformerLM(nn.Module):
 
         new_mems = self._update_mems(hids, mems, mlen, qlen)
 
-        return core_out, new_mems
+        return core_out, hids, new_mems
 
-    def forward(self, leaf_data, leaf_target, root_data, root_target, mems, predict_root=False, input_root=False ):
+    def forward(self, data, target, root_target, mems, class_prediction=False, multi_obj=False, mix_vocab=False ):
         # nn.DataParallel does not allow size(0) tensors to be broadcasted.
         # So, have to initialize size(0) mems inside the model forward.
         # Moreover, have to return new_mems to allow nn.DataParallel to piece
         # them together.
-        if not mems: mems = self.init_mems()
-
-        data = root_data if input_root else leaf_data
-        target = root_target if input_root else leaf_target        
+        if not mems: mems = self.init_mems()    
 
         tgt_len = target.size(0)
-        hidden, new_mems = self._forward(data, mems=mems)
+        hidden, hiddens, new_mems = self._forward(data, mems=mems)
 
         pred_hid = hidden[-tgt_len:]
 
-        auxilary_loss = []
-        if predict_root and not input_root:
-            indices = torch.reshape((leaf_target!=root_target),(-1,)).nonzero().squeeze()
-            root_hidden_state = torch.reshape(pred_hid,(-1, pred_hid.size(-1))).index_select(0, indices)
-            root_logits = self.crit._compute_logit(root_hidden_state, 
-                            self.word_emb.emb_layers[0].weight.index_select(0, torch.tensor(list(self.cl_root_vocab.keys()),device=hidden.device)),
-                            self.auxilary_output_layer.bias, proj=None)
-            #root_logits = self.auxilary_output_layer(root_hidden_state)
-            selected_root_target = torch.reshape(root_target,(-1,)).index_select(0,indices)
-            auxilary_target = torch.tensor([self.cl_root_vocab[x] for x in selected_root_target.tolist()],device=selected_root_target.device)
-            auxilary_loss = -F.log_softmax(root_logits, dim=1).gather(1, auxilary_target.unsqueeze(1)).squeeze(1)
-            loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,))) 
-        elif predict_root and input_root:
-            loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)),predict_root=True)
+        if class_prediction:
+            if multi_obj:
+                loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)))
+                indices = torch.reshape((target!=root_target),(-1,)).nonzero().squeeze()
+                root_pred_hid = self.drop(hiddens[-1])[-tgt_len:]
+                root_hidden_state = torch.reshape(root_pred_hid,(-1, root_pred_hid.size(-1))).index_select(0, indices)
+                root_hidden_state = self.auxilary_projection_layer(root_hidden_state)
+                root_logits = self.crit._compute_logit(root_hidden_state, 
+                                self.word_emb.emb_layers[0].weight.index_select(0, torch.tensor(list(self.cl_root_vocab.keys()),device=hidden.device)),
+                                self.auxilary_output_layer.bias, proj=None)
+                #root_logits = self.auxilary_output_layer(root_hidden_state)
+                selected_root_target = torch.reshape(root_target,(-1,)).index_select(0,indices)
+                auxilary_target = torch.tensor([self.cl_root_vocab[x] for x in selected_root_target.tolist()],device=selected_root_target.device)
+                auxilary_loss = -F.log_softmax(root_logits, dim=1).gather(1, auxilary_target.unsqueeze(1)).squeeze(1)
+            else:
+                if mix_vocab:
+                    loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(root_target,(-1,)),predict_root=True)
+                    indices = torch.reshape((target!=root_target),(-1,)).nonzero().squeeze()
+                    auxilary_loss = torch.reshape(loss,(-1,)).index_select(0,indices)
+                else:
+                    loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(root_target,(-1,)),general_words_only=True)
+                    indices = torch.reshape((target!=root_target),(-1,)).nonzero().squeeze()
+                    root_hidden_state = torch.reshape(pred_hid,(-1, pred_hid.size(-1))).index_select(0, indices)
+                    root_logits = self.crit._compute_logit(root_hidden_state, 
+                                    self.word_emb.emb_layers[0].weight.index_select(0, torch.tensor(list(self.cl_root_vocab.keys()),device=hidden.device)),
+                                    self.auxilary_output_layer.bias, proj=None)
+                    #root_logits = self.auxilary_output_layer(root_hidden_state)
+                    selected_root_target = torch.reshape(root_target,(-1,)).index_select(0,indices)
+                    auxilary_target = torch.tensor([self.cl_root_vocab[x] for x in selected_root_target.tolist()],device=selected_root_target.device)
+                    root_loss = -F.log_softmax(root_logits, dim=1).gather(1, auxilary_target.unsqueeze(1)).squeeze(1)
+                    loss.index_copy_(0, indices, root_loss)
+                    auxilary_loss = root_loss
         else:
-            loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,))) 
-
-
-        # if predict_root:
-        #     loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)),predict_root=True)
-        # else:
-        #     loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)))
-        loss = loss.view(tgt_len, -1)
-        if len(auxilary_loss) == 0:
+            loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)))
             auxilary_loss = torch.zeros_like(loss)
+        
+        loss = loss.view(tgt_len, -1)
+        # if len(auxilary_loss) == 0:
+        #     auxilary_loss = torch.zeros_like(loss)
         if new_mems is None:
             return [loss, auxilary_loss]
         else:

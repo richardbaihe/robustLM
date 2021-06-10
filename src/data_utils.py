@@ -257,35 +257,30 @@ class Corpus(object):
 
 def get_lm_corpus(args):
     corpus = None
-    if mpu.get_model_parallel_rank() == 0:
-        print('Producing dataset {} with rank {}'.format(args.dataset, args.rank))
-        kwargs = {}
-        if args.dataset in ['wt103']:
-            kwargs['special'] = ['<eos>','<sent_eos>']
-            kwargs['lower_case'] = False
-        else:
-            raise NotImplementedError
-        fn = os.path.join(args.data, 'cache.pt')
-        if os.path.exists(fn):
-            print('Loading cached dataset...')
-            corpus = torch.load(fn)
-        else:
-            corpus = MixCorpus(args, **kwargs)
-            torch.save(corpus, fn)
-        ntokens = torch.cuda.LongTensor([len(corpus.vocab)])
-        cl_root_tokens = torch.cuda.LongTensor(corpus.vocab.cl_root_tokens)
-        cl_leaf_tokens = torch.cuda.LongTensor(corpus.vocab.cl_leaf_tokens)
+    print('Producing dataset {} with rank {}'.format(args.dataset, args.rank))
+    kwargs = {}
+    if args.dataset in ['wt103']:
+        kwargs['special'] = ['<eos>','<sent_eos>']
+        kwargs['lower_case'] = False
     else:
-        ntokens = torch.cuda.LongTensor([0])
-        cl_root_tokens = torch.cuda.LongTensor([0])
-        cl_leaf_tokens = torch.cuda.LongTensor([0])
-    
-    torch.distributed.broadcast(ntokens, mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_data_parallel_group())
-    torch.distributed.broadcast(cl_root_tokens, mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_data_parallel_group())
-    torch.distributed.broadcast(cl_leaf_tokens, mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_data_parallel_group())
+        raise NotImplementedError
+    fn = os.path.join(args.data, 'cache.pt')
+    if os.path.exists(fn):
+        print('Loading cached dataset...')
+        corpus = torch.load(fn)
+    else:
+        corpus = MixCorpus(args, **kwargs)
+        torch.save(corpus, fn)
+    ntokens = torch.cuda.LongTensor([len(corpus.vocab)])
+    cl_root_tokens = torch.cuda.LongTensor(corpus.vocab.cl_root_tokens)
+    cl_leaf_tokens = torch.cuda.LongTensor(corpus.vocab.cl_leaf_tokens)
+
+    # torch.distributed.broadcast(ntokens, mpu.get_model_parallel_src_rank(),
+    #                             group=mpu.get_data_parallel_group())
+    # torch.distributed.broadcast(cl_root_tokens, mpu.get_model_parallel_src_rank(),
+    #                             group=mpu.get_data_parallel_group())
+    # torch.distributed.broadcast(cl_leaf_tokens, mpu.get_model_parallel_src_rank(),
+    #                             group=mpu.get_data_parallel_group())
 
     args.n_token = ntokens.item()
     args.cl_all_root_index = cl_root_tokens.tolist()
@@ -339,6 +334,7 @@ class MixLMOrderedIterator(LMOrderedIterator):
         seq_len = min(self.bptt, self.data.size(0) - 1 - i)
         # while i+seq_len >= self.data.size(0):
         #     i = max(0, i-self.data.size(0))
+        i = i*self.bptt
         end_idx = i + seq_len
         beg_idx = max(0, i - self.ext_len)
         start = self.rank*self.bsz//self.world_size

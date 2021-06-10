@@ -358,10 +358,12 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
 
         return logit
 
-    def forward(self, hidden, target, keep_order=False, predict_root=False):
+    def forward(self, hidden, target, keep_order=True, predict_root=False, general_words_only=False):
         '''
             hidden :: [len*bsz x d_proj]
             target :: [len*bsz]
+            predict_root: True for class label + general words; False for normal LM
+            separate_vocab: True for general words only
         '''
 
         if hidden.size(0) != target.size(0):
@@ -375,6 +377,9 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                 logit[:,self.cl_all_leaf_index] = -float('inf')
             else:
                 logit[:,self.cl_all_root_index] = -float('inf')
+            if general_words_only:
+                logit[:,self.cl_all_leaf_index+self.cl_all_root_index] = -float('inf')
+
             nll = -F.log_softmax(logit, dim=-1) \
                     .gather(1, target.unsqueeze(1)).squeeze(1)
         else:
@@ -405,6 +410,8 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                 head_logit.index_fill_(1,torch.tensor(head_leaf_index,device=head_logit.device),float('-inf'))
             else:
                 head_logit.index_fill_(1,torch.tensor(head_root_index,device=head_logit.device),float('-inf'))
+            if general_words_only:
+                head_logit.index_fill_(1,torch.tensor(head_leaf_index+head_root_index,device=head_logit.device),float('-inf'))
             #head_logit[:,0] = -float('inf')
             head_logprob = F.log_softmax(head_logit, dim=1)
 
@@ -437,6 +444,8 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                         tail_logit_i.index_fill_(1,torch.tensor(leaf_index_i,device=head_logit.device),float('-inf'))
                     else:
                         tail_logit_i.index_fill_(1,torch.tensor(root_index_i,device=head_logit.device),float('-inf'))
+                    if general_words_only:
+                        tail_logit_i.index_fill_(1,torch.tensor(leaf_index_i+root_index_i,device=head_logit.device),float('-inf'))
                     tail_logprob_i = F.log_softmax(tail_logit_i, dim=1)
 
                     logprob_i = head_logprob_i[:, -i] \

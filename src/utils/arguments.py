@@ -202,6 +202,12 @@ def add_classLM_config_args(parser):
                     help='which layer do multi objective prediction')
     group.add_argument('--mix_vocab', action='store_true',
                     help='predict class label and general words together in a mixed vocab')
+    group.add_argument('--auxiliary_layer', type=int, default=-1,
+                       help='use which layer for auxiliary task')
+    group.add_argument('--wn_layer', type=int, default=5,
+                       help='use which wordnet layer for class dictionary building')
+    group.add_argument('--adaptive_class_softmax', action='store_true',
+                       help='if true, predict class first and then predict the token')
     return parser
 
 def get_args():

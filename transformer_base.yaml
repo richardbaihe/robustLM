@@ -1,7 +1,7 @@
 target:
   service: amlk8s
-  name: itpmtlv100cl1
-  vc: MSRMTLVC1
+  name: itpscusv100cl
+  vc: resrchvc
   # service: aml
   # name: canada24
 
@@ -10,8 +10,9 @@ environment:
   # registry: nvcr.io
   image: richardbaihe/pytorch:azure
   setup:
-    - source setup.sh
-
+    - export MKL_SERVICE_FORCE_INTEL=1 
+    - python -m nltk.downloader punkt wordnet
+    
 code:
   local_dir: $CONFIG_DIR/src
   
@@ -21,10 +22,21 @@ data:
 
 # list of jobs to run, we run 2 jobs in this example
 jobs:
-- name: train
+- name: train_base
   sku: G4
   command:
-  - python train.py --dataset wt103
+  - python -m torch.distributed.launch 
+    --nproc_per_node 4 
+    --nnodes 1 
+    --node_rank 0 
+    --master_addr 127.0.0.1 
+    --master_port 16010
+    train.py 
+    --job_name trans_base
+    --batch_size 16
+    --max_step 200000
+    --cl_annealing 0
+    --dataset wt103
     --n_layer 16
     --d_model 410
     --n_head 10
@@ -33,42 +45,422 @@ jobs:
     --tgt_len 150
     --eval_tgt_len 150
     --mem_len 0
-    --batch_size 64
     --adaptive
     --fp16
     --dynamic-loss-scale
     --multi_gpu
     --cuda
     --pt
-- name: test
+    --do_train
+    --do_test
+- name: train_small_v2
   sku: G4
   command:
-  - python eval.py --dataset wt103
-    --tgt_len 400
-    --mem_len 0
-    --batch_size 10
-    --split test
-    --cuda
-    --pt
-- name: train_cl
-  sku: G4
-  command:
-  - python train.py --dataset wt103
-    --n_layer 16
-    --d_model 410
+  - python -m torch.distributed.launch 
+    --nproc_per_node 4 
+    --nnodes 1 
+    --node_rank 0 
+    --master_addr 127.0.0.1 
+    --master_port 16010
+    train.py 
+    --job_name trans_small
+    --dataset wt103
+    --max_step 100000
+    --batch_size 64
+    --n_layer 12
+    --d_model 300
     --n_head 10
-    --d_head 41
-    --d_inner 2100
+    --d_head 30
+    --d_inner 1500
     --tgt_len 150
     --eval_tgt_len 150
     --mem_len 0
-    --batch_size 64
     --adaptive
     --fp16
     --dynamic-loss-scale
     --multi_gpu
     --cuda
-    --mix_corpus
+    --pt
+    --do_train
+    --do_test
+- name: train_small_cl_anneal_input_root_mix_0.6
+  sku: G4
+  command:
+  - python -m torch.distributed.launch 
+    --nproc_per_node 4 
+    --nnodes 1 
+    --node_rank 0 
+    --master_addr 127.0.0.1 
+    --master_port 16010
+    train.py 
+    --job_name small_cl_anneal_input_root_mix
+    --batch_size 64
+    --max_step 100000
+    --cl_annealing 0.6
+    --mix_vocab
+    --input_root
+    --dataset wt103
+    --n_layer 12
+    --d_model 300
+    --n_head 10
+    --d_head 30
+    --d_inner 1500
+    --tgt_len 150
+    --eval_tgt_len 150
+    --mem_len 0
+    --adaptive
+    --fp16
+    --dynamic-loss-scale
+    --multi_gpu
+    --cuda
+    --pt
+    --do_train
+    --do_test
+- name: train_small_cl_anneal_input_root_separate
+  sku: G4
+  command:
+  - python -m torch.distributed.launch 
+    --nproc_per_node 4 
+    --nnodes 1 
+    --node_rank 0 
+    --master_addr 127.0.0.1 
+    --master_port 16010
+    train.py 
+    --job_name small_cl_anneal_input_root_separate
+    --batch_size 64
+    --max_step 100000
     --cl_annealing 0.4
+    --input_root
+    --dataset wt103
+    --n_layer 12
+    --d_model 300
+    --n_head 10
+    --d_head 30
+    --d_inner 1500
+    --tgt_len 150
+    --eval_tgt_len 150
+    --mem_len 0
+    --adaptive
+    --fp16
+    --dynamic-loss-scale
+    --multi_gpu
+    --cuda
     --pt
-    --job_name trans_small_mix_0.4
+    --do_train
+    --do_test
+- name: train_small_cl_anneal_input_leaf_mix
+  sku: G4
+  command:
+  - python -m torch.distributed.launch 
+    --nproc_per_node 4 
+    --nnodes 1 
+    --node_rank 0 
+    --master_addr 127.0.0.1 
+    --master_port 16010
+    train.py 
+    --job_name small_cl_anneal_input_leaf_mix
+    --batch_size 64
+    --max_step 100000
+    --cl_annealing 0.4
+    --mix_vocab
+    --dataset wt103
+    --n_layer 12
+    --d_model 300
+    --n_head 10
+    --d_head 30
+    --d_inner 1500
+    --tgt_len 150
+    --eval_tgt_len 150
+    --mem_len 0
+    --adaptive
+    --fp16
+    --dynamic-loss-scale
+    --multi_gpu
+    --cuda
+    --pt
+    --do_train
+    --do_test
+- name: train_small_cl_warmup_input_root_mix_v2
+  sku: G4
+  command:
+  - python -m torch.distributed.launch 
+    --nproc_per_node 4 
+    --nnodes 1 
+    --node_rank 0 
+    --master_addr 127.0.0.1 
+    --master_port 16010
+    train.py 
+    --job_name small_cl_warmup_input_root_mix
+    --batch_size 64
+    --max_step 100000
+    --cl_steps 20000
+    --mix_vocab
+    --input_root
+    --dataset wt103
+    --n_layer 12
+    --d_model 300
+    --n_head 10
+    --d_head 30
+    --d_inner 1500
+    --tgt_len 150
+    --eval_tgt_len 150
+    --mem_len 0
+    --adaptive
+    --fp16
+    --dynamic-loss-scale
+    --multi_gpu
+    --cuda
+    --pt
+    --do_train
+    --do_test
+- name: train_small_cl_multiobj_8_projected_mix
+  sku: G4
+  command:
+  - python -m torch.distributed.launch 
+    --nproc_per_node 4 
+    --nnodes 1 
+    --node_rank 0 
+    --master_addr 127.0.0.1 
+    --master_port 16010
+    train.py 
+    --job_name train_small_cl_multiobj_8_projected_mix
+    --batch_size 64
+    --max_step 100000
+    --cl_steps 100000
+    --auxiliary_layer 8
+    --mix_vocab
+    --multi_obj
+    --dataset wt103
+    --n_layer 12
+    --d_model 300
+    --n_head 10
+    --d_head 30
+    --d_inner 1500
+    --tgt_len 150
+    --eval_tgt_len 150
+    --mem_len 0
+    --adaptive
+    --fp16
+    --dynamic-loss-scale
+    --multi_gpu
+    --cuda
+    --pt
+    --do_train
+    --do_test
+
+- name: train_base_cl_warmup_input_root_mix
+  sku: G4
+  command:
+  - python -m torch.distributed.launch 
+    --nproc_per_node 4 
+    --nnodes 1 
+    --node_rank 0 
+    --master_addr 127.0.0.1 
+    --master_port 16010
+    train.py 
+    --job_name base_cl_warmup_input_root_mix
+    --batch_size 64
+    --max_step 200000
+    --cl_steps 20000
+    --mix_vocab
+    --input_root
+    --dataset wt103
+    --n_layer 16
+    --d_model 410
+    --n_head 10
+    --d_head 41
+    --d_inner 2100
+    --tgt_len 150
+    --eval_tgt_len 150
+    --mem_len 0
+    --adaptive
+    --fp16
+    --dynamic-loss-scale
+    --multi_gpu
+    --cuda
+    --pt
+    --do_train
+    --do_test
+- name: train_base_cl_anneal_input_leaf_mix
+  sku: G4
+  command:
+  - python -m torch.distributed.launch 
+    --nproc_per_node 4 
+    --nnodes 1 
+    --node_rank 0 
+    --master_addr 127.0.0.1 
+    --master_port 16010
+    train.py 
+    --job_name train_base_cl_anneal_input_leaf_mix
+    --batch_size 64
+    --max_step 100000
+    --cl_annealing 0.4
+    --mix_vocab
+    --dataset wt103
+    --n_layer 16
+    --d_model 410
+    --n_head 10
+    --d_head 41
+    --d_inner 2100
+    --tgt_len 150
+    --eval_tgt_len 150
+    --mem_len 0
+    --adaptive
+    --fp16
+    --dynamic-loss-scale
+    --multi_gpu
+    --cuda
+    --pt
+    --do_train
+    --do_test
+- name: train_base_cl_anneal_input_root_mix
+  sku: G4
+  command:
+  - python -m torch.distributed.launch 
+    --nproc_per_node 4 
+    --nnodes 1 
+    --node_rank 0 
+    --master_addr 127.0.0.1 
+    --master_port 16010
+    train.py 
+    --job_name train_base_cl_anneal_input_root_mix
+    --batch_size 64
+    --max_step 100000
+    --cl_annealing 0.4
+    --mix_vocab
+    --input_root
+    --dataset wt103
+    --n_layer 16
+    --d_model 410
+    --n_head 10
+    --d_head 41
+    --d_inner 2100
+    --tgt_len 150
+    --eval_tgt_len 150
+    --mem_len 0
+    --adaptive
+    --fp16
+    --dynamic-loss-scale
+    --multi_gpu
+    --cuda
+    --pt
+    --do_train
+    --do_test
+
+- name: train_small_adaptive
+  sku: G4
+  command:
+  - python -m torch.distributed.launch 
+    --nproc_per_node 4 
+    --nnodes 1 
+    --node_rank 0 
+    --master_addr 127.0.0.1 
+    --master_port 16010
+    train.py 
+    --job_name small_adaptive
+    --adaptive_class_softmax
+    --batch_size 64
+    --max_step 100000
+    --dataset wt103
+    --n_layer 12
+    --d_model 300
+    --n_head 10
+    --d_head 30
+    --d_inner 1500
+    --tgt_len 150
+    --eval_tgt_len 150
+    --mem_len 0
+    --adaptive
+    --fp16
+    --dynamic-loss-scale
+    --multi_gpu
+    --cuda
+    --pt
+    --do_train
+    --do_test
+
+# search:
+#   job_template:
+#     name: search_{experiment_name:s}_small_{auto:s}
+#     sku: G4
+#     command:
+#     - python -m torch.distributed.launch
+#       --nproc_per_node 4 
+#       --nnodes 1 
+#       --node_rank 0 
+#       --master_addr 127.0.0.1 
+#       --master_port 16010
+#       train.py 
+#       --job_name small_cl_steps_{cl_steps}
+#       --cl_steps {cl_steps}
+#       --cl_annealing 0
+#       --dataset wt103
+#       --max_step 100000
+#       --mix_vocab
+#       --input_root
+#       --batch_size 64
+#       --n_layer 12
+#       --d_model 300
+#       --n_head 10
+#       --d_head 30
+#       --d_inner 1500
+#       --tgt_len 150
+#       --eval_tgt_len 150
+#       --mem_len 0
+#       --adaptive
+#       --fp16
+#       --dynamic-loss-scale
+#       --multi_gpu
+#       --cuda
+#       --pt
+#       --do_train
+#       --do_test
+#   type: grid
+#   max_trials: 5
+#   params:
+#     - name: cl_steps
+#       spec: discrete
+#       values: [10000, 30000, 40000]
+
+search:
+  job_template:
+    name: search_{experiment_name:s}_small_{auto:s}
+    sku: G4
+    command:
+    - python -m torch.distributed.launch
+      --nproc_per_node 4 
+      --nnodes 1 
+      --node_rank 0 
+      --master_addr 127.0.0.1 
+      --master_port 16010
+      train.py 
+      --job_name small_cl_anneal_{cl_annealing}
+      --cl_steps 0
+      --cl_annealing {cl_annealing}
+      --dataset wt103
+      --max_step 100000
+      --mix_vocab
+      --input_root
+      --batch_size 64
+      --n_layer 12
+      --d_model 300
+      --n_head 10
+      --d_head 30
+      --d_inner 1500
+      --tgt_len 150
+      --eval_tgt_len 150
+      --mem_len 0
+      --adaptive
+      --fp16
+      --dynamic-loss-scale
+      --multi_gpu
+      --cuda
+      --pt
+      --do_train
+      --do_test
+  type: grid
+  max_trials: 5
+  params:
+    - name: cl_annealing
+      spec: discrete
+      values: [0.45, 0.64, 0.78, 0.9]

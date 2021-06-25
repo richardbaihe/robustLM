@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.proj_adaptive_softmax import ProjectedAdaptiveLogSoftmax,ClassedProjectedAdaptiveLogSoftmax
+from utils.proj_adaptive_softmax import ProjectedAdaptiveLogSoftmax, ClassedProjectedAdaptiveLogSoftmax, HeriarchicalClassedProjectedAdaptiveLogSoftmax
 from utils.log_uniform_sampler import LogUniformSampler, sample_logits
 # from longformer.diagonaled_mm_tvm import diagonaled_mm as diagonaled_mm_tvm, mask_invalid_locations
 
@@ -37,15 +37,16 @@ class PositionalEmbedding(nn.Module):
     def forward(self, pos_seq, bsz=None, sega=False):
         if sega:
             sinusoid_inp = torch.bmm(pos_seq.unsqueeze(-1),
-                                     self.inv_freq.unsqueeze(0).unsqueeze(0).expand(pos_seq.size(0),-1,-1))
+                                     self.inv_freq.unsqueeze(0).unsqueeze(0).expand(pos_seq.size(0), -1, -1))
         else:
             sinusoid_inp = torch.ger(pos_seq, self.inv_freq)
         pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
 
         if bsz is not None:
-            return pos_emb[:,None,:].expand(-1, bsz, -1)
+            return pos_emb[:, None, :].expand(-1, bsz, -1)
         else:
-            return pos_emb[:,None,:]
+            return pos_emb[:, None, :]
+
 
 class PositionwiseFF(nn.Module):
     def __init__(self, d_model, d_inner, dropout, pre_lnorm=False):
@@ -82,8 +83,9 @@ class PositionwiseFF(nn.Module):
 
         return output
 
+
 class MultiHeadAttn(nn.Module):
-    def __init__(self, n_head, d_model, d_head, dropout, dropatt=0, 
+    def __init__(self, n_head, d_model, d_head, dropout, dropatt=0,
                  pre_lnorm=False):
         super(MultiHeadAttn, self).__init__()
 
@@ -130,9 +132,11 @@ class MultiHeadAttn(nn.Module):
         attn_score.mul_(self.scale)
         if attn_mask is not None and attn_mask.any().item():
             if attn_mask.dim() == 2:
-                attn_score.masked_fill_(attn_mask[None,:,:,None].bool(), -float('inf'))
+                attn_score.masked_fill_(
+                    attn_mask[None, :, :, None].bool(), -float('inf'))
             elif attn_mask.dim() == 3:
-                attn_score.masked_fill_(attn_mask[:,:,:,None].bool(), -float('inf'))
+                attn_score.masked_fill_(
+                    attn_mask[:, :, :, None].bool(), -float('inf'))
 
         # [qlen x klen x bsz x n_head]
         attn_prob = F.softmax(attn_score, dim=1)
@@ -155,6 +159,7 @@ class MultiHeadAttn(nn.Module):
             output = self.layer_norm(h + attn_out)
 
         return output
+
 
 class RelMultiHeadAttn(nn.Module):
     def __init__(self, n_head, d_model, d_head, dropout, dropatt=0,
@@ -181,8 +186,8 @@ class RelMultiHeadAttn(nn.Module):
     def _parallelogram_mask(self, h, w, left=False):
         mask = torch.ones((h, w)).byte()
         m = min(h, w)
-        mask[:m,:m] = torch.triu(mask[:m,:m])
-        mask[-m:,-m:] = torch.tril(mask[-m:,-m:])
+        mask[:m, :m] = torch.triu(mask[:m, :m])
+        mask[-m:, -m:] = torch.tril(mask[-m:, -m:])
 
         if left:
             return mask
@@ -192,7 +197,7 @@ class RelMultiHeadAttn(nn.Module):
     def _shift(self, x, qlen, klen, mask, left=False):
         if qlen > 1:
             zero_pad = torch.zeros((x.size(0), qlen-1, x.size(2), x.size(3)),
-                                    device=x.device, dtype=x.dtype)
+                                   device=x.device, dtype=x.dtype)
         else:
             zero_pad = torch.zeros(0, device=x.device, dtype=x.dtype)
 
@@ -202,7 +207,7 @@ class RelMultiHeadAttn(nn.Module):
         else:
             x_padded = torch.cat([x, zero_pad], dim=1).expand(qlen, -1, -1, -1)
 
-        x = x_padded.masked_select(mask[:,:,None,None]) \
+        x = x_padded.masked_select(mask[:, :, None, None]) \
                     .view(qlen, klen, x.size(2), x.size(3))
 
         return x
@@ -218,18 +223,20 @@ class RelMultiHeadAttn(nn.Module):
 
         if zero_triu:
             ones = torch.ones((x.size(0), x.size(1)))
-            x = x * torch.tril(ones, x.size(1) - x.size(0))[:,:,None,None]
+            x = x * torch.tril(ones, x.size(1) - x.size(0))[:, :, None, None]
 
         return x
 
     def forward(self, w, r, attn_mask=None, mems=None):
         raise NotImplementedError
 
+
 class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
     def __init__(self, *args, **kwargs):
         super(RelPartialLearnableMultiHeadAttn, self).__init__(*args, **kwargs)
 
-        self.r_net = nn.Linear(self.d_model, self.n_head * self.d_head, bias=False)
+        self.r_net = nn.Linear(
+            self.d_model, self.n_head * self.d_head, bias=False)
 
     def forward(self, w, r, r_w_bias, r_r_bias, attn_mask=None, mems=None, sega=False):
         qlen, rlen, bsz = w.size(0), r.size(0), w.size(1)
@@ -255,24 +262,31 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
 
         klen = w_head_k.size(0)
 
-        w_head_q = w_head_q.view(qlen, bsz, self.n_head, self.d_head)           # qlen x bsz x n_head x d_head
-        w_head_k = w_head_k.view(klen, bsz, self.n_head, self.d_head)           # qlen x bsz x n_head x d_head
-        w_head_v = w_head_v.view(klen, bsz, self.n_head, self.d_head)           # qlen x bsz x n_head x d_head
+        # qlen x bsz x n_head x d_head
+        w_head_q = w_head_q.view(qlen, bsz, self.n_head, self.d_head)
+        # qlen x bsz x n_head x d_head
+        w_head_k = w_head_k.view(klen, bsz, self.n_head, self.d_head)
+        # qlen x bsz x n_head x d_head
+        w_head_v = w_head_v.view(klen, bsz, self.n_head, self.d_head)
 
         if sega:
             r_head_k = r_head_k.view(rlen, bsz, self.n_head, self.d_head)
         else:
-            r_head_k = r_head_k.view(rlen, self.n_head, self.d_head)                # qlen x n_head x d_head
+            # qlen x n_head x d_head
+            r_head_k = r_head_k.view(rlen, self.n_head, self.d_head)
 
         #### compute attention score
-        rw_head_q = w_head_q + r_w_bias                                         # qlen x bsz x n_head x d_head
-        AC = torch.einsum('ibnd,jbnd->ijbn', (rw_head_q, w_head_k))             # qlen x klen x bsz x n_head
+        # qlen x bsz x n_head x d_head
+        rw_head_q = w_head_q + r_w_bias
+        # qlen x klen x bsz x n_head
+        AC = torch.einsum('ibnd,jbnd->ijbn', (rw_head_q, w_head_k))
 
         rr_head_q = w_head_q + r_r_bias
         if sega:
             BD = torch.einsum('ibnd,jbnd->ijbn', (rr_head_q, r_head_k))
         else:
-            BD = torch.einsum('ibnd,jnd->ijbn', (rr_head_q, r_head_k))              # qlen x klen x bsz x n_head
+            # qlen x klen x bsz x n_head
+            BD = torch.einsum('ibnd,jnd->ijbn', (rr_head_q, r_head_k))
         BD = self._rel_shift(BD)
 
         # [qlen x klen x bsz x n_head]
@@ -283,10 +297,10 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
         if attn_mask is not None and attn_mask.any().item():
             if attn_mask.dim() == 2:
                 attn_score = attn_score.float().masked_fill(
-                    attn_mask[None,:,:,None].bool(), -float('inf')).type_as(attn_score)
+                    attn_mask[None, :, :, None].bool(), -float('inf')).type_as(attn_score)
             elif attn_mask.dim() == 3:
                 attn_score = attn_score.float().masked_fill(
-                    attn_mask[:,:,:,None].bool(), -float('inf')).type_as(attn_score)
+                    attn_mask[:, :, :, None].bool(), -float('inf')).type_as(attn_score)
 
         # [qlen x klen x bsz x n_head]
         attn_prob = F.softmax(attn_score, dim=1)
@@ -311,6 +325,7 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
             output = self.layer_norm(w + attn_out)
 
         return output, attn_score
+
 
 '''
 class LongformerRelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
@@ -455,6 +470,7 @@ class LongformerRelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
         return output
 '''
 
+
 class RelLearnableMultiHeadAttn(RelMultiHeadAttn):
     def __init__(self, *args, **kwargs):
         super(RelLearnableMultiHeadAttn, self).__init__(*args, **kwargs)
@@ -498,11 +514,15 @@ class RelLearnableMultiHeadAttn(RelMultiHeadAttn):
             r_bias = r_bias[-klen:]
 
         #### compute attention score
-        rw_head_q = w_head_q + r_w_bias[None]                                   # qlen x bsz x n_head x d_head
+        # qlen x bsz x n_head x d_head
+        rw_head_q = w_head_q + r_w_bias[None]
 
-        AC = torch.einsum('ibnd,jbnd->ijbn', (rw_head_q, w_head_k))             # qlen x klen x bsz x n_head
-        B_ = torch.einsum('ibnd,jnd->ijbn', (w_head_q, r_emb))                  # qlen x klen x bsz x n_head
-        D_ = r_bias[None, :, None]                                              # 1    x klen x 1   x n_head
+        # qlen x klen x bsz x n_head
+        AC = torch.einsum('ibnd,jbnd->ijbn', (rw_head_q, w_head_k))
+        # qlen x klen x bsz x n_head
+        B_ = torch.einsum('ibnd,jnd->ijbn', (w_head_q, r_emb))
+        # 1    x klen x 1   x n_head
+        D_ = r_bias[None, :, None]
         BD = self._rel_shift(B_ + D_)
 
         # [qlen x klen x bsz x n_head]
@@ -512,9 +532,11 @@ class RelLearnableMultiHeadAttn(RelMultiHeadAttn):
         #### compute attention probability
         if attn_mask is not None and attn_mask.any().item():
             if attn_mask.dim() == 2:
-                attn_score.masked_fill_(attn_mask[None,:,:,None].bool(), -float('inf'))
+                attn_score.masked_fill_(
+                    attn_mask[None, :, :, None].bool(), -float('inf'))
             elif attn_mask.dim() == 3:
-                attn_score.masked_fill_(attn_mask[:,:,:,None].bool(), -float('inf'))
+                attn_score.masked_fill_(
+                    attn_mask[:, :, :, None].bool(), -float('inf'))
 
         # [qlen x klen x bsz x n_head]
         attn_prob = F.softmax(attn_score, dim=1)
@@ -540,12 +562,14 @@ class RelLearnableMultiHeadAttn(RelMultiHeadAttn):
 
         return output
 
+
 class DecoderLayer(nn.Module):
     def __init__(self, n_head, d_model, d_head, d_inner, dropout, **kwargs):
         super(DecoderLayer, self).__init__()
 
-        self.dec_attn = MultiHeadAttn(n_head, d_model, d_head, dropout, **kwargs)
-        self.pos_ff = PositionwiseFF(d_model, d_inner, dropout, 
+        self.dec_attn = MultiHeadAttn(
+            n_head, d_model, d_head, dropout, **kwargs)
+        self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
                                      pre_lnorm=kwargs.get('pre_lnorm'))
 
     def forward(self, dec_inp, dec_attn_mask=None, mems=None):
@@ -556,14 +580,15 @@ class DecoderLayer(nn.Module):
 
         return output
 
+
 class RelLearnableDecoderLayer(nn.Module):
     def __init__(self, n_head, d_model, d_head, d_inner, dropout,
                  **kwargs):
         super(RelLearnableDecoderLayer, self).__init__()
 
         self.dec_attn = RelLearnableMultiHeadAttn(n_head, d_model, d_head, dropout,
-                                         **kwargs)
-        self.pos_ff = PositionwiseFF(d_model, d_inner, dropout, 
+                                                  **kwargs)
+        self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
                                      pre_lnorm=kwargs.get('pre_lnorm'))
 
     def forward(self, dec_inp, r_emb, r_w_bias, r_bias, dec_attn_mask=None, mems=None):
@@ -575,24 +600,26 @@ class RelLearnableDecoderLayer(nn.Module):
 
         return output
 
+
 class RelPartialLearnableDecoderLayer(nn.Module):
     def __init__(self, n_head, d_model, d_head, d_inner, dropout,
                  **kwargs):
         super(RelPartialLearnableDecoderLayer, self).__init__()
 
         self.dec_attn = RelPartialLearnableMultiHeadAttn(n_head, d_model,
-                            d_head, dropout, **kwargs)
-        self.pos_ff = PositionwiseFF(d_model, d_inner, dropout, 
+                                                         d_head, dropout, **kwargs)
+        self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
                                      pre_lnorm=kwargs.get('pre_lnorm'))
 
     def forward(self, dec_inp, r, r_w_bias, r_r_bias, dec_attn_mask=None, mems=None, sega=False):
 
         output, attn_score = self.dec_attn(dec_inp, r, r_w_bias, r_r_bias,
-                               attn_mask=dec_attn_mask,
-                               mems=mems,sega=sega)
+                                           attn_mask=dec_attn_mask,
+                                           mems=mems, sega=sega)
         output = self.pos_ff(output)
 
         return output, attn_score
+
 
 '''
 class LongformerRelPartialLearnableDecoderLayer(nn.Module):
@@ -615,8 +642,9 @@ class LongformerRelPartialLearnableDecoderLayer(nn.Module):
         return output
 '''
 
+
 class AdaptiveEmbedding(nn.Module):
-    def __init__(self, n_token, d_embed, d_proj, cutoffs, div_val=1, 
+    def __init__(self, n_token, d_embed, d_proj, cutoffs, div_val=1,
                  sample_softmax=False):
         super(AdaptiveEmbedding, self).__init__()
 
@@ -635,27 +663,29 @@ class AdaptiveEmbedding(nn.Module):
         self.emb_projs = nn.ParameterList()
         if div_val == 1:
             self.emb_layers.append(
-                nn.Embedding(n_token, d_embed, sparse=sample_softmax>0)
+                nn.Embedding(n_token, d_embed, sparse=sample_softmax > 0)
             )
             if d_proj != d_embed:
-                self.emb_projs.append(nn.Parameter(torch.Tensor(d_proj, d_embed)))
+                self.emb_projs.append(nn.Parameter(
+                    torch.Tensor(d_proj, d_embed)))
         else:
             for i in range(len(self.cutoffs)):
                 l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i+1]
                 d_emb_i = d_embed // (div_val ** i)
                 self.emb_layers.append(nn.Embedding(r_idx-l_idx, d_emb_i))
-                self.emb_projs.append(nn.Parameter(torch.Tensor(d_proj, d_emb_i)))
+                self.emb_projs.append(nn.Parameter(
+                    torch.Tensor(d_proj, d_emb_i)))
 
     def forward(self, inp):
         if self.div_val == 1:
             embed = self.emb_layers[0](inp)
             if self.d_proj != self.d_embed:
-                embed  = F.linear(embed, self.emb_projs[0])
+                embed = F.linear(embed, self.emb_projs[0])
         else:
             param = next(self.parameters())
             inp_flat = inp.view(-1)
-            emb_flat = torch.zeros([inp_flat.size(0), self.d_proj], 
-                dtype=param.dtype, device=param.device)
+            emb_flat = torch.zeros([inp_flat.size(0), self.d_proj],
+                                   dtype=param.dtype, device=param.device)
             for i in range(len(self.cutoffs)):
                 l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
 
@@ -677,6 +707,7 @@ class AdaptiveEmbedding(nn.Module):
 
         return embed
 
+
 def get_ith_embed_layer_given_index(index, word_emb):
     for i in range(len(word_emb.cutoffs)):
         l_idx, r_idx = word_emb.cutoff_ends[i], word_emb.cutoff_ends[i + 1]
@@ -685,14 +716,16 @@ def get_ith_embed_layer_given_index(index, word_emb):
             return i, new_index
     return -1, -1
 
+
 class MemTransformerLM(nn.Module):
     def __init__(self, n_token, n_layer, n_head, d_model, d_head, d_inner,
-                 dropout, dropatt, tie_weight=True, d_embed=None, 
+                 dropout, dropatt, tie_weight=True, d_embed=None,
                  div_val=1, tie_projs=[False], pre_lnorm=False,
-                 tgt_len=None, ext_len=None, mem_len=None, 
+                 tgt_len=None, ext_len=None, mem_len=None,
                  cutoffs=[], adapt_inp=False,
-                 same_length=False, attn_type=0, clamp_len=-1, 
-                 sample_softmax=-1, cl_all_root_index=None, cl_all_leaf_index=None):
+                 same_length=False, attn_type=0, clamp_len=-1,
+                 sample_softmax=-1, cl_all_root_index=None, cl_all_leaf_index=None,
+                 adaptive_class_softmax=False, cl_root_leaf_dict=None):
         super(MemTransformerLM, self).__init__()
         self.n_token = n_token
 
@@ -702,10 +735,11 @@ class MemTransformerLM(nn.Module):
         self.n_head = n_head
         self.d_head = d_head
 
-        self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs, 
+        self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs,
                                           div_val=div_val)
-        self.auxilary_projection_layer = nn.Linear(d_model, d_model)
-        self.auxilary_output_layer = nn.Linear(d_model, len(cl_all_root_index))
+        self.auxiliary_projection_layer = nn.Linear(d_model, d_model)
+        self.auxiliary_output_layer = nn.Linear(
+            d_model, len(cl_all_root_index))
         self.cl_root_vocab = {}
         self.drop = nn.Dropout(dropout)
 
@@ -719,7 +753,7 @@ class MemTransformerLM(nn.Module):
         self.attn_type = attn_type
 
         self.layers = nn.ModuleList()
-        if attn_type == 0: # the default attention
+        if attn_type == 0:  # the default attention
             for i in range(n_layer):
                 self.layers.append(
                     RelPartialLearnableDecoderLayer(
@@ -727,7 +761,7 @@ class MemTransformerLM(nn.Module):
                         tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
                         dropatt=dropatt, pre_lnorm=pre_lnorm)
                 )
-        elif attn_type == 1: # learnable embeddings
+        elif attn_type == 1:  # learnable embeddings
             for i in range(n_layer):
                 self.layers.append(
                     RelLearnableDecoderLayer(
@@ -735,7 +769,7 @@ class MemTransformerLM(nn.Module):
                         tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
                         dropatt=dropatt, pre_lnorm=pre_lnorm)
                 )
-        elif attn_type in [2, 3]: # absolute embeddings
+        elif attn_type in [2, 3]:  # absolute embeddings
             for i in range(n_layer):
                 self.layers.append(
                     DecoderLayer(
@@ -755,14 +789,19 @@ class MemTransformerLM(nn.Module):
         else:
             if not cl_all_root_index or not cl_all_leaf_index:
 
-                self.crit = ProjectedAdaptiveLogSoftmax(n_token, d_embed, d_model, 
+                self.crit = ProjectedAdaptiveLogSoftmax(n_token, d_embed, d_model,
                                                         cutoffs, div_val=div_val)
+            elif adaptive_class_softmax:
+                self.crit = HeriarchicalClassedProjectedAdaptiveLogSoftmax(n_token, d_embed, d_model,
+                                                                           cutoffs, div_val=div_val,
+                                                                           cl_root_leaf_dict=cl_root_leaf_dict)
             else:
-                self.crit = ClassedProjectedAdaptiveLogSoftmax(n_token, d_embed, d_model, 
-                                                        cutoffs, div_val=div_val, 
-                                                        cl_all_root_index=cl_all_root_index, 
-                                                        cl_all_leaf_index=cl_all_leaf_index)
-                self.cl_root_vocab = {old_idx:new_idx for new_idx, old_idx in enumerate(cl_all_root_index)}
+                self.crit = ClassedProjectedAdaptiveLogSoftmax(n_token, d_embed, d_model,
+                                                               cutoffs, div_val=div_val,
+                                                               cl_all_root_index=cl_all_root_index,
+                                                               cl_all_leaf_index=cl_all_leaf_index)
+                self.cl_root_vocab = {
+                    old_idx: new_idx for new_idx, old_idx in enumerate(cl_all_root_index)}
             if tie_weight:
                 for i in range(len(self.crit.out_layers)):
                     self.crit.out_layers[i].weight = self.word_emb.emb_layers[i].weight
@@ -771,7 +810,7 @@ class MemTransformerLM(nn.Module):
                 #             # i, new_k = get_ith_embed_layer_given_index(k, self.word_emb)
                 #             # assert i>=0, "Error when building root embedding"
                 #         indices = torch.tensor(cl_all_root_index)
-                #         self.auxilary_output_layer.weight = self.word_emb.emb_layers[0].weight.index_select(0, indices)
+                #         self.auxiliary_output_layer.weight = self.word_emb.emb_layers[0].weight.index_select(0, indices)
 
             if tie_projs:
                 for i, tie_proj in enumerate(tie_projs):
@@ -789,22 +828,24 @@ class MemTransformerLM(nn.Module):
         self.sample_softmax = -1
 
     def _create_params(self):
-        if self.attn_type == 0: # default attention
+        if self.attn_type == 0:  # default attention
             self.pos_emb = PositionalEmbedding(self.d_model)
-            self.r_w_bias = nn.Parameter(torch.Tensor(self.n_head, self.d_head))
-            self.r_r_bias = nn.Parameter(torch.Tensor(self.n_head, self.d_head))
-        elif self.attn_type == 1: # learnable
+            self.r_w_bias = nn.Parameter(
+                torch.Tensor(self.n_head, self.d_head))
+            self.r_r_bias = nn.Parameter(
+                torch.Tensor(self.n_head, self.d_head))
+        elif self.attn_type == 1:  # learnable
             self.r_emb = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head, self.d_head))
+                self.n_layer, self.max_klen, self.n_head, self.d_head))
             self.r_w_bias = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.n_head, self.d_head))
+                self.n_layer, self.n_head, self.d_head))
             self.r_bias = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head))
-        elif self.attn_type == 2: # absolute standard
+                self.n_layer, self.max_klen, self.n_head))
+        elif self.attn_type == 2:  # absolute standard
             self.pos_emb = PositionalEmbedding(self.d_model)
-        elif self.attn_type == 3: # absolute deeper SA
+        elif self.attn_type == 3:  # absolute deeper SA
             self.r_emb = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head, self.d_head))
+                self.n_layer, self.max_klen, self.n_head, self.d_head))
 
     def reset_length(self, tgt_len, ext_len, mem_len):
         self.tgt_len = tgt_len
@@ -825,7 +866,8 @@ class MemTransformerLM(nn.Module):
 
     def _update_mems(self, hids, mems, qlen, mlen):
         # does not deal with None
-        if mems is None: return None
+        if mems is None:
+            return None
 
         # mems is not None
         assert len(hids) == len(mems), 'len(hids) != len(mems)'
@@ -861,14 +903,14 @@ class MemTransformerLM(nn.Module):
             else:
                 mask_shift_len = qlen
             dec_attn_mask = (torch.triu(all_ones, 1+mlen)
-                    + torch.tril(all_ones, -mask_shift_len)).byte()[:, :, None] # -1
+                             + torch.tril(all_ones, -mask_shift_len)).byte()[:, :, None]  # -1
         else:
             dec_attn_mask = torch.triu(
-                word_emb.new_ones(qlen, klen), diagonal=1+mlen).byte()[:,:,None]
+                word_emb.new_ones(qlen, klen), diagonal=1+mlen).byte()[:, :, None]
 
         hids = []
-        if self.attn_type == 0: # default
-            pos_seq = torch.arange(klen-1, -1, -1.0, device=word_emb.device, 
+        if self.attn_type == 0:  # default
+            pos_seq = torch.arange(klen-1, -1, -1.0, device=word_emb.device,
                                    dtype=word_emb.dtype)
             if self.clamp_len > 0:
                 pos_seq.clamp_(max=self.clamp_len)
@@ -880,24 +922,24 @@ class MemTransformerLM(nn.Module):
             hids.append(core_out)
             for i, layer in enumerate(self.layers):
                 mems_i = None if mems is None else mems[i]
-                core_out,_ = layer(core_out, pos_emb, self.r_w_bias,
-                        self.r_r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
+                core_out, _ = layer(core_out, pos_emb, self.r_w_bias,
+                                    self.r_r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
                 hids.append(core_out)
-        elif self.attn_type == 1: # learnable
+        elif self.attn_type == 1:  # learnable
             core_out = self.drop(word_emb)
             hids.append(core_out)
             for i, layer in enumerate(self.layers):
                 if self.clamp_len > 0:
-                    r_emb = self.r_emb[i][-self.clamp_len :]
-                    r_bias = self.r_bias[i][-self.clamp_len :]
+                    r_emb = self.r_emb[i][-self.clamp_len:]
+                    r_bias = self.r_bias[i][-self.clamp_len:]
                 else:
                     r_emb, r_bias = self.r_emb[i], self.r_bias[i]
 
                 mems_i = None if mems is None else mems[i]
                 core_out = layer(core_out, r_emb, self.r_w_bias[i],
-                        r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
+                                 r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
                 hids.append(core_out)
-        elif self.attn_type == 2: # absolute
+        elif self.attn_type == 2:  # absolute
             pos_seq = torch.arange(klen - 1, -1, -1.0, device=word_emb.device,
                                    dtype=word_emb.dtype)
             if self.clamp_len > 0:
@@ -924,7 +966,8 @@ class MemTransformerLM(nn.Module):
                     cur_emb = self.r_emb[i][:-qlen]
                     cur_size = cur_emb.size(0)
                     if cur_size < mlen:
-                        cur_emb_pad = cur_emb[0:1].expand(mlen-cur_size, -1, -1)
+                        cur_emb_pad = cur_emb[0:1].expand(
+                            mlen-cur_size, -1, -1)
                         cur_emb = torch.cat([cur_emb_pad, cur_emb], 0)
                     else:
                         cur_emb = cur_emb[-mlen:]
@@ -941,61 +984,81 @@ class MemTransformerLM(nn.Module):
 
         return core_out, hids, new_mems
 
-    def forward(self, data, target, root_target, mems, class_prediction=False, multi_obj=False, mix_vocab=False ):
+    def auxiliary_forward(self, hiddens, indices, root_target, tgt_len, auxiliary_layer=-1):
+        root_pred_hid = self.drop(hiddens[auxiliary_layer])[-tgt_len:]
+        root_hidden_state = torch.reshape(
+            root_pred_hid, (-1, root_pred_hid.size(-1))).index_select(0, indices)
+        root_hidden_state = self.auxiliary_projection_layer(root_hidden_state)
+        root_logits = self.crit._compute_logit(root_hidden_state,
+                                               self.word_emb.emb_layers[0].weight.index_select(0, torch.tensor(
+                                                   list(self.cl_root_vocab.keys()), device=root_pred_hid.device)),
+                                               bias=None, proj=None)
+        #root_logits = self.auxiliary_output_layer(root_hidden_state)
+        selected_root_target = torch.reshape(
+            root_target, (-1,)).index_select(0, indices)
+        auxiliary_target = torch.tensor(
+            [self.cl_root_vocab[x] for x in selected_root_target.tolist()], device=selected_root_target.device)
+        auxiliary_loss = - \
+            F.log_softmax(root_logits, dim=1).gather(
+                1, auxiliary_target.unsqueeze(1)).squeeze(1)
+        return auxiliary_loss
+
+    def forward(self, data, target, root_target, mems, args, class_prediction=False):
         # nn.DataParallel does not allow size(0) tensors to be broadcasted.
         # So, have to initialize size(0) mems inside the model forward.
         # Moreover, have to return new_mems to allow nn.DataParallel to piece
         # them together.
-        if not mems: mems = self.init_mems()    
+        multi_obj=args.multi_obj
+        mix_vocab=args.mix_vocab
+        auxiliary_layer = args.auxiliary_layer
+        if not mems:
+            mems = self.init_mems()
 
         tgt_len = target.size(0)
         hidden, hiddens, new_mems = self._forward(data, mems=mems)
 
         pred_hid = hidden[-tgt_len:]
-
+        indices = torch.reshape((target != root_target),
+                                (-1,)).nonzero().squeeze()
         if class_prediction:
             if multi_obj:
-                loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)))
-                indices = torch.reshape((target!=root_target),(-1,)).nonzero().squeeze()
-                root_pred_hid = self.drop(hiddens[-1])[-tgt_len:]
-                root_hidden_state = torch.reshape(root_pred_hid,(-1, root_pred_hid.size(-1))).index_select(0, indices)
-                root_hidden_state = self.auxilary_projection_layer(root_hidden_state)
-                root_logits = self.crit._compute_logit(root_hidden_state, 
-                                self.word_emb.emb_layers[0].weight.index_select(0, torch.tensor(list(self.cl_root_vocab.keys()),device=hidden.device)),
-                                self.auxilary_output_layer.bias, proj=None)
-                #root_logits = self.auxilary_output_layer(root_hidden_state)
-                selected_root_target = torch.reshape(root_target,(-1,)).index_select(0,indices)
-                auxilary_target = torch.tensor([self.cl_root_vocab[x] for x in selected_root_target.tolist()],device=selected_root_target.device)
-                auxilary_loss = -F.log_softmax(root_logits, dim=1).gather(1, auxilary_target.unsqueeze(1)).squeeze(1)
-            else:
+                # predict both the normal targets for all tokens and then, predict the root labels for the leaf nodes
+                loss = self.crit(torch.reshape(
+                    pred_hid, (-1, pred_hid.size(-1))), torch.reshape(target, (-1,)))
                 if mix_vocab:
-                    loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(root_target,(-1,)),predict_root=True)
-                    indices = torch.reshape((target!=root_target),(-1,)).nonzero().squeeze()
-                    auxilary_loss = torch.reshape(loss,(-1,)).index_select(0,indices)
+                    auxiliary_loss = self.crit(torch.reshape(
+                        pred_hid, (-1, pred_hid.size(-1))), torch.reshape(root_target, (-1,)), predict_root=True)
+                    auxiliary_loss = torch.reshape(
+                        auxiliary_loss, (-1,)).index_select(0, indices)
                 else:
-                    loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(root_target,(-1,)),general_words_only=True)
-                    indices = torch.reshape((target!=root_target),(-1,)).nonzero().squeeze()
-                    root_hidden_state = torch.reshape(pred_hid,(-1, pred_hid.size(-1))).index_select(0, indices)
-                    root_logits = self.crit._compute_logit(root_hidden_state, 
-                                    self.word_emb.emb_layers[0].weight.index_select(0, torch.tensor(list(self.cl_root_vocab.keys()),device=hidden.device)),
-                                    self.auxilary_output_layer.bias, proj=None)
-                    #root_logits = self.auxilary_output_layer(root_hidden_state)
-                    selected_root_target = torch.reshape(root_target,(-1,)).index_select(0,indices)
-                    auxilary_target = torch.tensor([self.cl_root_vocab[x] for x in selected_root_target.tolist()],device=selected_root_target.device)
-                    root_loss = -F.log_softmax(root_logits, dim=1).gather(1, auxilary_target.unsqueeze(1)).squeeze(1)
-                    loss.index_copy_(0, indices, root_loss)
-                    auxilary_loss = root_loss
+                    auxiliary_loss = self.auxiliary_forward(
+                        hiddens, indices, root_target, tgt_len, auxiliary_layer)
+            else:
+                # predict the normal targets only for non-leaf nodes and root labels for the leaf nodes
+                if mix_vocab:
+                    loss = self.crit(torch.reshape(pred_hid, (-1, pred_hid.size(-1))),
+                                     torch.reshape(root_target, (-1,)), predict_root=True)
+                    auxiliary_loss = torch.reshape(
+                        loss, (-1,)).index_select(0, indices)
+                else:
+                    loss = self.crit(torch.reshape(pred_hid, (-1, pred_hid.size(-1))),
+                                     torch.reshape(root_target, (-1,)), predict_root=False)
+                    auxiliary_loss = self.auxiliary_forward(
+                        hiddens, indices, root_target, tgt_len, auxiliary_layer)
+                    loss.index_copy_(0, indices, auxiliary_loss)
         else:
-            loss = self.crit(torch.reshape(pred_hid,(-1, pred_hid.size(-1))), torch.reshape(target,(-1,)))
-            auxilary_loss = torch.zeros_like(loss)
-        
+            loss = self.crit(torch.reshape(
+                pred_hid, (-1, pred_hid.size(-1))), torch.reshape(target, (-1,)))
+            auxiliary_loss = torch.zeros_like(loss)
+
         loss = loss.view(tgt_len, -1)
-        # if len(auxilary_loss) == 0:
-        #     auxilary_loss = torch.zeros_like(loss)
+        # if len(auxiliary_loss) == 0:
+        #     auxiliary_loss = torch.zeros_like(loss)
         if new_mems is None:
-            return [loss, auxilary_loss]
+            return [loss, auxiliary_loss]
         else:
-            return [loss, auxilary_loss] + new_mems
+            return [loss, auxiliary_loss] + new_mems
+
 
 class SegaMemTransformerLM(nn.Module):
     def __init__(self, n_token, n_layer, n_head, d_model, d_head, d_inner,
@@ -1004,7 +1067,7 @@ class SegaMemTransformerLM(nn.Module):
                  tgt_len=None, ext_len=None, mem_len=None,
                  cutoffs=[], adapt_inp=False,
                  same_length=False, attn_type=0, clamp_len=-1,
-                 sample_softmax=-1,sparse_mode='none'):
+                 sample_softmax=-1, sparse_mode='none'):
         super(SegaMemTransformerLM, self).__init__()
         self.n_token = n_token
 
@@ -1031,7 +1094,7 @@ class SegaMemTransformerLM(nn.Module):
         self.attn_type = attn_type
 
         self.layers = nn.ModuleList()
-        if attn_type == 0: # the default attention
+        if attn_type == 0:  # the default attention
             for i in range(n_layer):
                 self.layers.append(
                     RelPartialLearnableDecoderLayer(
@@ -1039,7 +1102,7 @@ class SegaMemTransformerLM(nn.Module):
                         tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
                         dropatt=dropatt, pre_lnorm=pre_lnorm)
                 )
-        elif attn_type == 1: # learnable embeddings
+        elif attn_type == 1:  # learnable embeddings
             for i in range(n_layer):
                 self.layers.append(
                     RelLearnableDecoderLayer(
@@ -1047,7 +1110,7 @@ class SegaMemTransformerLM(nn.Module):
                         tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
                         dropatt=dropatt, pre_lnorm=pre_lnorm)
                 )
-        elif attn_type in [2, 3]: # absolute embeddings
+        elif attn_type in [2, 3]:  # absolute embeddings
             for i in range(n_layer):
                 self.layers.append(
                     DecoderLayer(
@@ -1089,27 +1152,29 @@ class SegaMemTransformerLM(nn.Module):
         self.sample_softmax = -1
 
     def _create_params(self):
-        if self.attn_type == 0: # default attention
-            t_pos_size = self.d_model//3 + self.d_model//3%2
-            s_pos_size = self.d_model//3 + self.d_model//3%2
+        if self.attn_type == 0:  # default attention
+            t_pos_size = self.d_model//3 + self.d_model//3 % 2
+            s_pos_size = self.d_model//3 + self.d_model//3 % 2
             p_pos_size = self.d_model - t_pos_size - s_pos_size
             self.t_pos_emb = PositionalEmbedding(t_pos_size)
             self.s_pos_emb = PositionalEmbedding(s_pos_size)
             self.p_pos_emb = PositionalEmbedding(p_pos_size)
-            self.r_w_bias = nn.Parameter(torch.Tensor(self.n_head, self.d_head))
-            self.r_r_bias = nn.Parameter(torch.Tensor(self.n_head, self.d_head))
-        elif self.attn_type == 1: # learnable
+            self.r_w_bias = nn.Parameter(
+                torch.Tensor(self.n_head, self.d_head))
+            self.r_r_bias = nn.Parameter(
+                torch.Tensor(self.n_head, self.d_head))
+        elif self.attn_type == 1:  # learnable
             self.r_emb = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head, self.d_head))
+                self.n_layer, self.max_klen, self.n_head, self.d_head))
             self.r_w_bias = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.n_head, self.d_head))
+                self.n_layer, self.n_head, self.d_head))
             self.r_bias = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head))
-        elif self.attn_type == 2: # absolute standard
+                self.n_layer, self.max_klen, self.n_head))
+        elif self.attn_type == 2:  # absolute standard
             self.pos_emb = PositionalEmbedding(self.d_model)
-        elif self.attn_type == 3: # absolute deeper SA
+        elif self.attn_type == 3:  # absolute deeper SA
             self.r_emb = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head, self.d_head))
+                self.n_layer, self.max_klen, self.n_head, self.d_head))
 
     def reset_length(self, tgt_len, ext_len, mem_len):
         self.tgt_len = tgt_len
@@ -1131,16 +1196,17 @@ class SegaMemTransformerLM(nn.Module):
     def init_mems_pst(self):
         if self.mem_len > 0:
             param = next(parameters(self))
-            mems_pst=(torch.empty(0, dtype=torch.int64, device=param.device),
-                      torch.empty(0, dtype=torch.int64, device=param.device),
-                      torch.empty(0, dtype=torch.int64, device=param.device))
+            mems_pst = (torch.empty(0, dtype=torch.int64, device=param.device),
+                        torch.empty(0, dtype=torch.int64, device=param.device),
+                        torch.empty(0, dtype=torch.int64, device=param.device))
             return mems_pst
         else:
             return None
 
     def _update_mems(self, hids, mems, qlen, mlen):
         # does not deal with None
-        if mems is None: return None
+        if mems is None:
+            return None
 
         # mems is not None
         assert len(hids) == len(mems), 'len(hids) != len(mems)'
@@ -1175,13 +1241,14 @@ class SegaMemTransformerLM(nn.Module):
             else:
                 mask_shift_len = qlen
             dec_attn_mask = (torch.triu(all_ones, 1+mlen)
-                    + torch.tril(all_ones, -mask_shift_len)).byte()[:, :, None] # -1
+                             + torch.tril(all_ones, -mask_shift_len)).byte()[:, :, None]  # -1
         else:
             dec_attn_mask = torch.triu(
-                word_emb.new_ones(qlen, klen), diagonal=1+mlen).byte()[:,:,None]
-        def local_window_mask(input_mask,pst,window_length,global_pos=False):
+                word_emb.new_ones(qlen, klen), diagonal=1+mlen).byte()[:, :, None]
+
+        def local_window_mask(input_mask, pst, window_length, global_pos=False):
             # q k 1
-            qlen,klen,_ = input_mask.size()
+            qlen, klen, _ = input_mask.size()
             # klen bsz
             p, s, t = pst
             sentence_end = ~torch.cat([s[1:, :], -s.new_ones(1, bsz)]).eq(s)
@@ -1193,39 +1260,51 @@ class SegaMemTransformerLM(nn.Module):
             if global_pos:
                 window_mask = window_mask.repeat(1, 1, bsz)
                 for i in range(bsz):
-                    sentence_end_i = sentence_end[:,i].nonzero().squeeze(-1).tolist()
-                    paragraph_end_i = paragraph_end[:, i].nonzero().squeeze(-1).tolist()
+                    sentence_end_i = sentence_end[:,
+                                                  i].nonzero().squeeze(-1).tolist()
+                    paragraph_end_i = paragraph_end[:, i].nonzero(
+                    ).squeeze(-1).tolist()
                     for end in sentence_end_i:
                         window_mask[:, end, i] = 0
                         if end in paragraph_end_i:
                             window_mask[:, end - 1, i] = 0
             input_mask = input_mask | window_mask
             return input_mask
-        def sega_window_mask(input_mask,pst,sent_window=1,global_pos=False):
+
+        def sega_window_mask(input_mask, pst, sent_window=1, global_pos=False):
             # qlen klen bsz
-            input_mask = input_mask.repeat(1,1,bsz)
+            input_mask = input_mask.repeat(1, 1, bsz)
             empty_input_mask = input_mask.new_ones(input_mask.size())
             # klen bsz
-            p,s,t = pst
-            sentence_end = ~torch.cat([s[mlen+1:,:],-s.new_ones(1,bsz)]).eq(s[mlen:,:])
-            all_paragraph_end = ~torch.cat([p[1:,:],-p.new_ones(1,bsz)]).eq(p)
-            all_sentence_start = ~torch.cat([-s.new_ones(1, bsz), s[:-1, :]]).eq(s)
-            all_sentence_end = ~torch.cat([s[1:, :], -s.new_ones(1, bsz)]).eq(s)
+            p, s, t = pst
+            sentence_end = ~torch.cat(
+                [s[mlen+1:, :], -s.new_ones(1, bsz)]).eq(s[mlen:, :])
+            all_paragraph_end = ~torch.cat(
+                [p[1:, :], -p.new_ones(1, bsz)]).eq(p)
+            all_sentence_start = ~torch.cat(
+                [-s.new_ones(1, bsz), s[:-1, :]]).eq(s)
+            all_sentence_end = ~torch.cat(
+                [s[1:, :], -s.new_ones(1, bsz)]).eq(s)
 
             for i in range(bsz):
-                all_sentence_start_i = all_sentence_start[:,i].nonzero().squeeze(-1).tolist()
-                sentence_end_i = sentence_end[:,i].nonzero().squeeze(-1).tolist()
-                all_sentence_end_i = all_sentence_end[:,i].nonzero().squeeze(-1).tolist()
-                all_paragraph_end_i = all_paragraph_end[:,i].nonzero().squeeze(-1).tolist()
+                all_sentence_start_i = all_sentence_start[:, i].nonzero(
+                ).squeeze(-1).tolist()
+                sentence_end_i = sentence_end[:,
+                                              i].nonzero().squeeze(-1).tolist()
+                all_sentence_end_i = all_sentence_end[:, i].nonzero(
+                ).squeeze(-1).tolist()
+                all_paragraph_end_i = all_paragraph_end[:, i].nonzero(
+                ).squeeze(-1).tolist()
                 last_sentence_start_list = [0]*sent_window
-                for start,end in zip(all_sentence_start_i,all_sentence_end_i):
+                for start, end in zip(all_sentence_start_i, all_sentence_end_i):
                     if sent_window > 1:
                         last_sentence_start = last_sentence_start_list[-sent_window + 1]
                     else:
                         last_sentence_start = start
                     if end-mlen in sentence_end_i:
-                        bq = 0 if start-mlen<0 else 0
-                        empty_input_mask[bq:end-mlen+1,last_sentence_start:end+1,i] = 0
+                        bq = 0 if start-mlen < 0 else 0
+                        empty_input_mask[bq:end-mlen+1,
+                                         last_sentence_start:end+1, i] = 0
                     last_sentence_start_list.pop(0)
                     last_sentence_start_list.append(start)
                     if global_pos:
@@ -1236,22 +1315,23 @@ class SegaMemTransformerLM(nn.Module):
 
             # q k bsz
             return output_mask
+
         def heuristic_mask(attn_score, input_mask):
             empty_input_mask = input_mask.new_ones(input_mask.size())
 
         hids = []
-        if self.attn_type == 0: # default
+        if self.attn_type == 0:  # default
             p, s, t = pst
-            if mlen>0:
+            if mlen > 0:
                 m_p, m_s, m_t = mems_pst
 
-                ab_t = torch.cat([m_t,t], 0)
-                ab_p = torch.cat([m_p,p],0)
-                ab_s = torch.cat([m_s,s],0)
+                ab_t = torch.cat([m_t, t], 0)
+                ab_p = torch.cat([m_p, p], 0)
+                ab_s = torch.cat([m_s, s], 0)
             else:
-                ab_p,ab_s,ab_t = p,s,t
-            max_t,_ = ab_t.max(0)
-            t_pos_seq = max_t.unsqueeze(0).expand(ab_t.size(0),-1) - ab_t
+                ab_p, ab_s, ab_t = p, s, t
+            max_t, _ = ab_t.max(0)
+            t_pos_seq = max_t.unsqueeze(0).expand(ab_t.size(0), -1) - ab_t
             max_p, _ = ab_p.max(0)
             p_pos_seq = max_p.unsqueeze(0).expand(ab_p.size(0), -1) - ab_p
             max_s, _ = ab_s.max(0)
@@ -1264,10 +1344,13 @@ class SegaMemTransformerLM(nn.Module):
                 t_pos_seq.clamp_(max=self.clamp_len)
                 s_pos_seq.clamp_(max=self.clamp_len)
                 p_pos_seq.clamp_(max=self.clamp_len)
-            t_pos_emb = self.t_pos_emb(t_pos_seq.to(dtype=word_emb.dtype),sega=True)
-            s_pos_emb = self.s_pos_emb(s_pos_seq.to(dtype=word_emb.dtype),sega=True)
-            p_pos_emb = self.p_pos_emb(p_pos_seq.to(dtype=word_emb.dtype),sega=True)
-            pos_emb = torch.cat([t_pos_emb,s_pos_emb,p_pos_emb],-1)
+            t_pos_emb = self.t_pos_emb(
+                t_pos_seq.to(dtype=word_emb.dtype), sega=True)
+            s_pos_emb = self.s_pos_emb(
+                s_pos_seq.to(dtype=word_emb.dtype), sega=True)
+            p_pos_emb = self.p_pos_emb(
+                p_pos_seq.to(dtype=word_emb.dtype), sega=True)
+            pos_emb = torch.cat([t_pos_emb, s_pos_emb, p_pos_emb], -1)
 
             core_out = self.drop(word_emb)
             pos_emb = self.drop(pos_emb)
@@ -1282,42 +1365,42 @@ class SegaMemTransformerLM(nn.Module):
             # fix window size
             if "static" in self.sparse_mode:
                 window_length = int(self.sparse_mode.split('_')[0][6:])
-                dec_attn_mask = local_window_mask(dec_attn_mask, [ab_p, ab_s,ab_t],
+                dec_attn_mask = local_window_mask(dec_attn_mask, [ab_p, ab_s, ab_t],
                                                   window_length=window_length, global_pos=global_pos)
             # dynamic window size
             elif "dynamic" in self.sparse_mode:
                 window_length = int(self.sparse_mode.split('_')[0][7:])
-                dec_attn_mask = sega_window_mask(dec_attn_mask, [ab_p, ab_s,ab_t], sent_window=window_length,
+                dec_attn_mask = sega_window_mask(dec_attn_mask, [ab_p, ab_s, ab_t], sent_window=window_length,
                                                  global_pos=global_pos)
-
 
             for i, layer in enumerate(self.layers):
                 if 'layer' in self.sparse_mode:
                     n_layer = int(self.sparse_mode.split('_')[-1][5:])
-                    if i<n_layer:
+                    if i < n_layer:
                         dec_attn_mask = dec_attn_mask_origin
                 mems_i = None if mems is None else mems[i]
                 core_out, attn_score = layer(core_out, pos_emb, self.r_w_bias,
-                        self.r_r_bias, dec_attn_mask=dec_attn_mask,
-                                 mems=mems_i,sega=True)
+                                             self.r_r_bias, dec_attn_mask=dec_attn_mask,
+                                             mems=mems_i, sega=True)
                 if 'heuristic' in self.sparse_mode:
-                    dec_attn_mask = heuristic_mask(attn_score, dec_attn_mask_origin)
+                    dec_attn_mask = heuristic_mask(
+                        attn_score, dec_attn_mask_origin)
                 hids.append(core_out)
-        elif self.attn_type == 1: # learnable
+        elif self.attn_type == 1:  # learnable
             core_out = self.drop(word_emb)
             hids.append(core_out)
             for i, layer in enumerate(self.layers):
                 if self.clamp_len > 0:
-                    r_emb = self.r_emb[i][-self.clamp_len :]
-                    r_bias = self.r_bias[i][-self.clamp_len :]
+                    r_emb = self.r_emb[i][-self.clamp_len:]
+                    r_bias = self.r_bias[i][-self.clamp_len:]
                 else:
                     r_emb, r_bias = self.r_emb[i], self.r_bias[i]
 
                 mems_i = None if mems is None else mems[i]
                 core_out = layer(core_out, r_emb, self.r_w_bias[i],
-                        r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
+                                 r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
                 hids.append(core_out)
-        elif self.attn_type == 2: # absolute
+        elif self.attn_type == 2:  # absolute
             pos_seq = torch.arange(klen - 1, -1, -1.0, device=word_emb.device,
                                    dtype=word_emb.dtype)
             if self.clamp_len > 0:
@@ -1344,7 +1427,8 @@ class SegaMemTransformerLM(nn.Module):
                     cur_emb = self.r_emb[i][:-qlen]
                     cur_size = cur_emb.size(0)
                     if cur_size < mlen:
-                        cur_emb_pad = cur_emb[0:1].expand(mlen-cur_size, -1, -1)
+                        cur_emb_pad = cur_emb[0:1].expand(
+                            mlen-cur_size, -1, -1)
                         cur_emb = torch.cat([cur_emb_pad, cur_emb], 0)
                     else:
                         cur_emb = cur_emb[-mlen:]
@@ -1366,25 +1450,30 @@ class SegaMemTransformerLM(nn.Module):
         # So, have to initialize size(0) mems inside the model forward.
         # Moreover, have to return new_mems to allow nn.DataParallel to piece
         # them together.
-        if not mems: mems = self.init_mems()
-        if not mems_pst: mems_pst = self.init_mems_pst()
+        if not mems:
+            mems = self.init_mems()
+        if not mems_pst:
+            mems_pst = self.init_mems_pst()
         tgt_len = target.size(0)
-        hidden, new_mems = self._forward(data, mems=mems, pst=pst, mems_pst=mems_pst)
+        hidden, new_mems = self._forward(
+            data, mems=mems, pst=pst, mems_pst=mems_pst)
 
         pred_hid = hidden[-tgt_len:]
         if self.sample_softmax > 0 and self.training:
             assert self.tie_weight
             logit = sample_logits(self.word_emb,
-                self.out_layer.bias, target, pred_hid, self.sampler)
+                                  self.out_layer.bias, target, pred_hid, self.sampler)
             loss = -F.log_softmax(logit, -1)[:, :, 0]
         else:
-            loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)), target.contiguous().view(-1),keep_order=True)
+            loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)),
+                             target.contiguous().view(-1), keep_order=True)
             loss = loss.view(tgt_len, -1)
 
         if new_mems is None:
             return [loss]
         else:
             return [loss] + new_mems
+
 
 class Sega_wo_p_MemTransformerLM(nn.Module):
     def __init__(self, n_token, n_layer, n_head, d_model, d_head, d_inner,
@@ -1418,7 +1507,7 @@ class Sega_wo_p_MemTransformerLM(nn.Module):
         self.attn_type = attn_type
 
         self.layers = nn.ModuleList()
-        if attn_type == 0: # the default attention
+        if attn_type == 0:  # the default attention
             for i in range(n_layer):
                 self.layers.append(
                     RelPartialLearnableDecoderLayer(
@@ -1426,7 +1515,7 @@ class Sega_wo_p_MemTransformerLM(nn.Module):
                         tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
                         dropatt=dropatt, pre_lnorm=pre_lnorm)
                 )
-        elif attn_type == 1: # learnable embeddings
+        elif attn_type == 1:  # learnable embeddings
             for i in range(n_layer):
                 self.layers.append(
                     RelLearnableDecoderLayer(
@@ -1434,7 +1523,7 @@ class Sega_wo_p_MemTransformerLM(nn.Module):
                         tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
                         dropatt=dropatt, pre_lnorm=pre_lnorm)
                 )
-        elif attn_type in [2, 3]: # absolute embeddings
+        elif attn_type in [2, 3]:  # absolute embeddings
             for i in range(n_layer):
                 self.layers.append(
                     DecoderLayer(
@@ -1476,26 +1565,28 @@ class Sega_wo_p_MemTransformerLM(nn.Module):
         self.sample_softmax = -1
 
     def _create_params(self):
-        if self.attn_type == 0: # default attention
-            t_pos_size = self.d_model//2 + self.d_model//2%2
+        if self.attn_type == 0:  # default attention
+            t_pos_size = self.d_model//2 + self.d_model//2 % 2
             s_pos_size = self.d_model - t_pos_size
             self.t_pos_emb = PositionalEmbedding(t_pos_size)
             self.s_pos_emb = PositionalEmbedding(s_pos_size)
             # self.p_pos_emb = PositionalEmbedding(p_pos_size)
-            self.r_w_bias = nn.Parameter(torch.Tensor(self.n_head, self.d_head))
-            self.r_r_bias = nn.Parameter(torch.Tensor(self.n_head, self.d_head))
-        elif self.attn_type == 1: # learnable
+            self.r_w_bias = nn.Parameter(
+                torch.Tensor(self.n_head, self.d_head))
+            self.r_r_bias = nn.Parameter(
+                torch.Tensor(self.n_head, self.d_head))
+        elif self.attn_type == 1:  # learnable
             self.r_emb = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head, self.d_head))
+                self.n_layer, self.max_klen, self.n_head, self.d_head))
             self.r_w_bias = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.n_head, self.d_head))
+                self.n_layer, self.n_head, self.d_head))
             self.r_bias = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head))
-        elif self.attn_type == 2: # absolute standard
+                self.n_layer, self.max_klen, self.n_head))
+        elif self.attn_type == 2:  # absolute standard
             self.pos_emb = PositionalEmbedding(self.d_model)
-        elif self.attn_type == 3: # absolute deeper SA
+        elif self.attn_type == 3:  # absolute deeper SA
             self.r_emb = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head, self.d_head))
+                self.n_layer, self.max_klen, self.n_head, self.d_head))
 
     def reset_length(self, tgt_len, ext_len, mem_len):
         self.tgt_len = tgt_len
@@ -1517,16 +1608,17 @@ class Sega_wo_p_MemTransformerLM(nn.Module):
     def init_mems_pst(self):
         if self.mem_len > 0:
             param = next(self.parameters())
-            mems_pst=(torch.empty(0, dtype=torch.int64, device=param.device),
-                      torch.empty(0, dtype=torch.int64, device=param.device),
-                      torch.empty(0, dtype=torch.int64, device=param.device))
+            mems_pst = (torch.empty(0, dtype=torch.int64, device=param.device),
+                        torch.empty(0, dtype=torch.int64, device=param.device),
+                        torch.empty(0, dtype=torch.int64, device=param.device))
             return mems_pst
         else:
             return None
 
     def _update_mems(self, hids, mems, qlen, mlen):
         # does not deal with None
-        if mems is None: return None
+        if mems is None:
+            return None
 
         # mems is not None
         assert len(hids) == len(mems), 'len(hids) != len(mems)'
@@ -1561,21 +1653,21 @@ class Sega_wo_p_MemTransformerLM(nn.Module):
             else:
                 mask_shift_len = qlen
             dec_attn_mask = (torch.triu(all_ones, 1+mlen)
-                    + torch.tril(all_ones, -mask_shift_len)).byte()[:, :, None] # -1
+                             + torch.tril(all_ones, -mask_shift_len)).byte()[:, :, None]  # -1
         else:
             dec_attn_mask = torch.triu(
-                word_emb.new_ones(qlen, klen), diagonal=1+mlen).byte()[:,:,None]
+                word_emb.new_ones(qlen, klen), diagonal=1+mlen).byte()[:, :, None]
 
         hids = []
-        if self.attn_type == 0: # default
+        if self.attn_type == 0:  # default
             p, s, t = pst
             m_p, m_s, m_t = mems_pst
 
             ab_t = torch.cat([m_t, t], 0)
             #ab_p = torch.cat([m_p,p],0)
-            ab_s = torch.cat([m_s,s],0)
-            max_t,_ = ab_t.max(0)
-            t_pos_seq = max_t.unsqueeze(0).expand(ab_t.size(0),-1) - ab_t
+            ab_s = torch.cat([m_s, s], 0)
+            max_t, _ = ab_t.max(0)
+            t_pos_seq = max_t.unsqueeze(0).expand(ab_t.size(0), -1) - ab_t
             #max_p, _ = ab_p.max(0)
             #p_pos_seq = max_p.unsqueeze(0).expand(ab_p.size(0), -1) - ab_p
             max_s, _ = ab_s.max(0)
@@ -1588,10 +1680,12 @@ class Sega_wo_p_MemTransformerLM(nn.Module):
                 t_pos_seq.clamp_(max=self.clamp_len)
                 s_pos_seq.clamp_(max=self.clamp_len)
                 #p_pos_seq.clamp_(max=self.clamp_len)
-            t_pos_emb = self.t_pos_emb(t_pos_seq.to(dtype=word_emb.dtype),sega=True)
-            s_pos_emb = self.s_pos_emb(s_pos_seq.to(dtype=word_emb.dtype),sega=True)
+            t_pos_emb = self.t_pos_emb(
+                t_pos_seq.to(dtype=word_emb.dtype), sega=True)
+            s_pos_emb = self.s_pos_emb(
+                s_pos_seq.to(dtype=word_emb.dtype), sega=True)
             # p_pos_emb = self.p_pos_emb(p_pos_seq.to(dtype=word_emb.dtype),sega=True)
-            pos_emb = torch.cat([t_pos_emb,s_pos_emb],-1)
+            pos_emb = torch.cat([t_pos_emb, s_pos_emb], -1)
 
             core_out = self.drop(word_emb)
             pos_emb = self.drop(pos_emb)
@@ -1600,24 +1694,24 @@ class Sega_wo_p_MemTransformerLM(nn.Module):
             for i, layer in enumerate(self.layers):
                 mems_i = None if mems is None else mems[i]
                 core_out = layer(core_out, pos_emb, self.r_w_bias,
-                        self.r_r_bias, dec_attn_mask=dec_attn_mask,
-                                 mems=mems_i,sega=True)
+                                 self.r_r_bias, dec_attn_mask=dec_attn_mask,
+                                 mems=mems_i, sega=True)
                 hids.append(core_out)
-        elif self.attn_type == 1: # learnable
+        elif self.attn_type == 1:  # learnable
             core_out = self.drop(word_emb)
             hids.append(core_out)
             for i, layer in enumerate(self.layers):
                 if self.clamp_len > 0:
-                    r_emb = self.r_emb[i][-self.clamp_len :]
-                    r_bias = self.r_bias[i][-self.clamp_len :]
+                    r_emb = self.r_emb[i][-self.clamp_len:]
+                    r_bias = self.r_bias[i][-self.clamp_len:]
                 else:
                     r_emb, r_bias = self.r_emb[i], self.r_bias[i]
 
                 mems_i = None if mems is None else mems[i]
                 core_out = layer(core_out, r_emb, self.r_w_bias[i],
-                        r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
+                                 r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
                 hids.append(core_out)
-        elif self.attn_type == 2: # absolute
+        elif self.attn_type == 2:  # absolute
             pos_seq = torch.arange(klen - 1, -1, -1.0, device=word_emb.device,
                                    dtype=word_emb.dtype)
             if self.clamp_len > 0:
@@ -1644,7 +1738,8 @@ class Sega_wo_p_MemTransformerLM(nn.Module):
                     cur_emb = self.r_emb[i][:-qlen]
                     cur_size = cur_emb.size(0)
                     if cur_size < mlen:
-                        cur_emb_pad = cur_emb[0:1].expand(mlen-cur_size, -1, -1)
+                        cur_emb_pad = cur_emb[0:1].expand(
+                            mlen-cur_size, -1, -1)
                         cur_emb = torch.cat([cur_emb_pad, cur_emb], 0)
                     else:
                         cur_emb = cur_emb[-mlen:]
@@ -1666,25 +1761,30 @@ class Sega_wo_p_MemTransformerLM(nn.Module):
         # So, have to initialize size(0) mems inside the model forward.
         # Moreover, have to return new_mems to allow nn.DataParallel to piece
         # them together.
-        if not mems: mems = self.init_mems()
-        if not mems_pst: mems_pst = self.init_mems_pst()
+        if not mems:
+            mems = self.init_mems()
+        if not mems_pst:
+            mems_pst = self.init_mems_pst()
         tgt_len = target.size(0)
-        hidden, new_mems = self._forward(data, mems=mems, pst=pst, mems_pst=mems_pst)
+        hidden, new_mems = self._forward(
+            data, mems=mems, pst=pst, mems_pst=mems_pst)
 
         pred_hid = hidden[-tgt_len:]
         if self.sample_softmax > 0 and self.training:
             assert self.tie_weight
             logit = sample_logits(self.word_emb,
-                self.out_layer.bias, target, pred_hid, self.sampler)
+                                  self.out_layer.bias, target, pred_hid, self.sampler)
             loss = -F.log_softmax(logit, -1)[:, :, 0]
         else:
-            loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)), target.view(-1))
+            loss = self.crit(
+                pred_hid.view(-1, pred_hid.size(-1)), target.view(-1))
             loss = loss.view(tgt_len, -1)
 
         if new_mems is None:
             return [loss]
         else:
             return [loss] + new_mems
+
 
 class Sega_wo_s_MemTransformerLM(nn.Module):
     def __init__(self, n_token, n_layer, n_head, d_model, d_head, d_inner,
@@ -1718,7 +1818,7 @@ class Sega_wo_s_MemTransformerLM(nn.Module):
         self.attn_type = attn_type
 
         self.layers = nn.ModuleList()
-        if attn_type == 0: # the default attention
+        if attn_type == 0:  # the default attention
             for i in range(n_layer):
                 self.layers.append(
                     RelPartialLearnableDecoderLayer(
@@ -1726,7 +1826,7 @@ class Sega_wo_s_MemTransformerLM(nn.Module):
                         tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
                         dropatt=dropatt, pre_lnorm=pre_lnorm)
                 )
-        elif attn_type == 1: # learnable embeddings
+        elif attn_type == 1:  # learnable embeddings
             for i in range(n_layer):
                 self.layers.append(
                     RelLearnableDecoderLayer(
@@ -1734,7 +1834,7 @@ class Sega_wo_s_MemTransformerLM(nn.Module):
                         tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
                         dropatt=dropatt, pre_lnorm=pre_lnorm)
                 )
-        elif attn_type in [2, 3]: # absolute embeddings
+        elif attn_type in [2, 3]:  # absolute embeddings
             for i in range(n_layer):
                 self.layers.append(
                     DecoderLayer(
@@ -1776,27 +1876,29 @@ class Sega_wo_s_MemTransformerLM(nn.Module):
         self.sample_softmax = -1
 
     def _create_params(self):
-        if self.attn_type == 0: # default attention
-            t_pos_size = self.d_model//2 + self.d_model//2%2
+        if self.attn_type == 0:  # default attention
+            t_pos_size = self.d_model//2 + self.d_model//2 % 2
             #s_pos_size = self.d_model//3 + self.d_model//3%2
             p_pos_size = self.d_model - t_pos_size
             self.t_pos_emb = PositionalEmbedding(t_pos_size)
             #self.s_pos_emb = PositionalEmbedding(s_pos_size)
             self.p_pos_emb = PositionalEmbedding(p_pos_size)
-            self.r_w_bias = nn.Parameter(torch.Tensor(self.n_head, self.d_head))
-            self.r_r_bias = nn.Parameter(torch.Tensor(self.n_head, self.d_head))
-        elif self.attn_type == 1: # learnable
+            self.r_w_bias = nn.Parameter(
+                torch.Tensor(self.n_head, self.d_head))
+            self.r_r_bias = nn.Parameter(
+                torch.Tensor(self.n_head, self.d_head))
+        elif self.attn_type == 1:  # learnable
             self.r_emb = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head, self.d_head))
+                self.n_layer, self.max_klen, self.n_head, self.d_head))
             self.r_w_bias = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.n_head, self.d_head))
+                self.n_layer, self.n_head, self.d_head))
             self.r_bias = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head))
-        elif self.attn_type == 2: # absolute standard
+                self.n_layer, self.max_klen, self.n_head))
+        elif self.attn_type == 2:  # absolute standard
             self.pos_emb = PositionalEmbedding(self.d_model)
-        elif self.attn_type == 3: # absolute deeper SA
+        elif self.attn_type == 3:  # absolute deeper SA
             self.r_emb = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head, self.d_head))
+                self.n_layer, self.max_klen, self.n_head, self.d_head))
 
     def reset_length(self, tgt_len, ext_len, mem_len):
         self.tgt_len = tgt_len
@@ -1818,16 +1920,17 @@ class Sega_wo_s_MemTransformerLM(nn.Module):
     def init_mems_pst(self):
         if self.mem_len > 0:
             param = next(self.parameters())
-            mems_pst=(torch.empty(0, dtype=torch.int64, device=param.device),
-                      torch.empty(0, dtype=torch.int64, device=param.device),
-                      torch.empty(0, dtype=torch.int64, device=param.device))
+            mems_pst = (torch.empty(0, dtype=torch.int64, device=param.device),
+                        torch.empty(0, dtype=torch.int64, device=param.device),
+                        torch.empty(0, dtype=torch.int64, device=param.device))
             return mems_pst
         else:
             return None
 
     def _update_mems(self, hids, mems, qlen, mlen):
         # does not deal with None
-        if mems is None: return None
+        if mems is None:
+            return None
 
         # mems is not None
         assert len(hids) == len(mems), 'len(hids) != len(mems)'
@@ -1862,21 +1965,21 @@ class Sega_wo_s_MemTransformerLM(nn.Module):
             else:
                 mask_shift_len = qlen
             dec_attn_mask = (torch.triu(all_ones, 1+mlen)
-                    + torch.tril(all_ones, -mask_shift_len)).byte()[:, :, None] # -1
+                             + torch.tril(all_ones, -mask_shift_len)).byte()[:, :, None]  # -1
         else:
             dec_attn_mask = torch.triu(
-                word_emb.new_ones(qlen, klen), diagonal=1+mlen).byte()[:,:,None]
+                word_emb.new_ones(qlen, klen), diagonal=1+mlen).byte()[:, :, None]
 
         hids = []
-        if self.attn_type == 0: # default
+        if self.attn_type == 0:  # default
             p, s, t = pst
             m_p, m_s, m_t = mems_pst
 
             ab_t = torch.cat([m_t, t], 0)
-            ab_p = torch.cat([m_p,p],0)
+            ab_p = torch.cat([m_p, p], 0)
             #ab_s = torch.cat([m_s,s],0)
-            max_t,_ = ab_t.max(0)
-            t_pos_seq = max_t.unsqueeze(0).expand(ab_t.size(0),-1) - ab_t
+            max_t, _ = ab_t.max(0)
+            t_pos_seq = max_t.unsqueeze(0).expand(ab_t.size(0), -1) - ab_t
             max_p, _ = ab_p.max(0)
             p_pos_seq = max_p.unsqueeze(0).expand(ab_p.size(0), -1) - ab_p
             #max_s, _ = ab_s.max(0)
@@ -1889,10 +1992,12 @@ class Sega_wo_s_MemTransformerLM(nn.Module):
                 t_pos_seq.clamp_(max=self.clamp_len)
                 #s_pos_seq.clamp_(max=self.clamp_len)
                 p_pos_seq.clamp_(max=self.clamp_len)
-            t_pos_emb = self.t_pos_emb(t_pos_seq.to(dtype=word_emb.dtype),sega=True)
+            t_pos_emb = self.t_pos_emb(
+                t_pos_seq.to(dtype=word_emb.dtype), sega=True)
             #s_pos_emb = self.s_pos_emb(s_pos_seq.to(dtype=word_emb.dtype),sega=True)
-            p_pos_emb = self.p_pos_emb(p_pos_seq.to(dtype=word_emb.dtype),sega=True)
-            pos_emb = torch.cat([t_pos_emb,p_pos_emb],-1)
+            p_pos_emb = self.p_pos_emb(
+                p_pos_seq.to(dtype=word_emb.dtype), sega=True)
+            pos_emb = torch.cat([t_pos_emb, p_pos_emb], -1)
 
             core_out = self.drop(word_emb)
             pos_emb = self.drop(pos_emb)
@@ -1901,24 +2006,24 @@ class Sega_wo_s_MemTransformerLM(nn.Module):
             for i, layer in enumerate(self.layers):
                 mems_i = None if mems is None else mems[i]
                 core_out = layer(core_out, pos_emb, self.r_w_bias,
-                        self.r_r_bias, dec_attn_mask=dec_attn_mask,
-                                 mems=mems_i,sega=True)
+                                 self.r_r_bias, dec_attn_mask=dec_attn_mask,
+                                 mems=mems_i, sega=True)
                 hids.append(core_out)
-        elif self.attn_type == 1: # learnable
+        elif self.attn_type == 1:  # learnable
             core_out = self.drop(word_emb)
             hids.append(core_out)
             for i, layer in enumerate(self.layers):
                 if self.clamp_len > 0:
-                    r_emb = self.r_emb[i][-self.clamp_len :]
-                    r_bias = self.r_bias[i][-self.clamp_len :]
+                    r_emb = self.r_emb[i][-self.clamp_len:]
+                    r_bias = self.r_bias[i][-self.clamp_len:]
                 else:
                     r_emb, r_bias = self.r_emb[i], self.r_bias[i]
 
                 mems_i = None if mems is None else mems[i]
                 core_out = layer(core_out, r_emb, self.r_w_bias[i],
-                        r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
+                                 r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
                 hids.append(core_out)
-        elif self.attn_type == 2: # absolute
+        elif self.attn_type == 2:  # absolute
             pos_seq = torch.arange(klen - 1, -1, -1.0, device=word_emb.device,
                                    dtype=word_emb.dtype)
             if self.clamp_len > 0:
@@ -1945,7 +2050,8 @@ class Sega_wo_s_MemTransformerLM(nn.Module):
                     cur_emb = self.r_emb[i][:-qlen]
                     cur_size = cur_emb.size(0)
                     if cur_size < mlen:
-                        cur_emb_pad = cur_emb[0:1].expand(mlen-cur_size, -1, -1)
+                        cur_emb_pad = cur_emb[0:1].expand(
+                            mlen-cur_size, -1, -1)
                         cur_emb = torch.cat([cur_emb_pad, cur_emb], 0)
                     else:
                         cur_emb = cur_emb[-mlen:]
@@ -1967,25 +2073,30 @@ class Sega_wo_s_MemTransformerLM(nn.Module):
         # So, have to initialize size(0) mems inside the model forward.
         # Moreover, have to return new_mems to allow nn.DataParallel to piece
         # them together.
-        if not mems: mems = self.init_mems()
-        if not mems_pst: mems_pst = self.init_mems_pst()
+        if not mems:
+            mems = self.init_mems()
+        if not mems_pst:
+            mems_pst = self.init_mems_pst()
         tgt_len = target.size(0)
-        hidden, new_mems = self._forward(data, mems=mems, pst=pst, mems_pst=mems_pst)
+        hidden, new_mems = self._forward(
+            data, mems=mems, pst=pst, mems_pst=mems_pst)
 
         pred_hid = hidden[-tgt_len:]
         if self.sample_softmax > 0 and self.training:
             assert self.tie_weight
             logit = sample_logits(self.word_emb,
-                self.out_layer.bias, target, pred_hid, self.sampler)
+                                  self.out_layer.bias, target, pred_hid, self.sampler)
             loss = -F.log_softmax(logit, -1)[:, :, 0]
         else:
-            loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)), target.view(-1))
+            loss = self.crit(
+                pred_hid.view(-1, pred_hid.size(-1)), target.view(-1))
             loss = loss.view(tgt_len, -1)
 
         if new_mems is None:
             return [loss]
         else:
             return [loss] + new_mems
+
 
 '''
 class LongTransformerLM(nn.Module):
@@ -2311,7 +2422,8 @@ if __name__ == '__main__':
     import data_utils
 
     data = torch.LongTensor(data_len*B).random_(0, args.n_token).to(device)
-    diter = data_utils.LMOrderedIterator(data, B, tgt_len, device=device, ext_len=ext_len)
+    diter = data_utils.LMOrderedIterator(
+        data, B, tgt_len, device=device, ext_len=ext_len)
 
     cutoffs = [args.n_token // 2]
     tie_projs = [False] + [True] * len(cutoffs)
@@ -2319,12 +2431,12 @@ if __name__ == '__main__':
     for div_val in [1, 2]:
         for d_embed in [200, 100]:
             model = MemTransformerLM(args.n_token, args.n_layer, args.n_head,
-                            args.d_model, args.d_head, args.d_inner, args.dropout,
-                            dropatt=args.dropout, tie_weight=True, 
-                            d_embed=d_embed, div_val=div_val, 
-                            tie_projs=tie_projs, pre_lnorm=True,
-                            tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len, 
-                            cutoffs=cutoffs, attn_type=0).to(device)
+                                     args.d_model, args.d_head, args.d_inner, args.dropout,
+                                     dropatt=args.dropout, tie_weight=True,
+                                     d_embed=d_embed, div_val=div_val,
+                                     tie_projs=tie_projs, pre_lnorm=True,
+                                     tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
+                                     cutoffs=cutoffs, attn_type=0).to(device)
 
             print(sum(p.numel() for p in model.parameters()))
 

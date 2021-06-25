@@ -1,11 +1,13 @@
-import os, sys
+import os
+import sys
 import glob
 import mpu
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, defaultdict
 import numpy as np
 import torch
 
 from utils.vocabulary import Vocab, SegaVocab
+
 
 class LMOrderedIterator(object):
     def __init__(self, data, bsz, bptt, device='cpu', ext_len=None):
@@ -15,10 +17,10 @@ class LMOrderedIterator(object):
         self.bsz = bsz
         self.bptt = bptt
         self.ext_len = ext_len if ext_len is not None else 0
-        self.sega =  isinstance(data, tuple)
+        self.sega = isinstance(data, tuple)
         self.device = device
         if self.sega:
-            data,p,s,t = data
+            data, p, s, t = data
         # Work out how cleanly we can divide the dataset into bsz parts.
         self.n_step = data.size(0) // bsz
 
@@ -37,7 +39,8 @@ class LMOrderedIterator(object):
         self.n_batch = (self.n_step + self.bptt - 1) // self.bptt
 
     def get_batch(self, i, bptt=None):
-        if bptt is None: bptt = self.bptt
+        if bptt is None:
+            bptt = self.bptt
         seq_len = min(bptt, self.data.size(0) - 1 - i)
 
         end_idx = i + seq_len
@@ -47,7 +50,8 @@ class LMOrderedIterator(object):
         target = self.data[i+1:i+1+seq_len]
         pst = tuple()
         if self.sega:
-            pst = (self.p[beg_idx:end_idx], self.s[beg_idx:end_idx],self.t[beg_idx:end_idx])
+            pst = (self.p[beg_idx:end_idx],
+                   self.s[beg_idx:end_idx], self.t[beg_idx:end_idx])
         return data, target, seq_len, pst
 
     def get_fixlen_iter(self, start=0):
@@ -157,7 +161,7 @@ class LMShuffledIterator(object):
 
 class LMMultiFileIterator(LMShuffledIterator):
     def __init__(self, paths, vocab, bsz, bptt, device='cpu', ext_len=None,
-        shuffle=False):
+                 shuffle=False):
 
         self.paths = paths
         self.vocab = vocab
@@ -198,15 +202,22 @@ class Corpus(object):
         self.add_sent_eos = sent_eos
 
         if self.dataset in ['ptb', 'wt2', 'text8']:
-            self.vocab.count_file(os.path.join(path, 'train.txt'),sega=sega,sent_eos=sent_eos)
-            self.vocab.count_file(os.path.join(path, 'valid.txt'),sega=sega,sent_eos=sent_eos)
-            self.vocab.count_file(os.path.join(path, 'test.txt'),sega=sega,sent_eos=sent_eos)
+            self.vocab.count_file(os.path.join(
+                path, 'train.txt'), sega=sega, sent_eos=sent_eos)
+            self.vocab.count_file(os.path.join(
+                path, 'valid.txt'), sega=sega, sent_eos=sent_eos)
+            self.vocab.count_file(os.path.join(
+                path, 'test.txt'), sega=sega, sent_eos=sent_eos)
         elif self.dataset == 'enwik8':
-            self.vocab.count_file(os.path.join(path, 'train.txt.raw'),sega=sega,sent_eos=sent_eos,char_level=True)
-            self.vocab.count_file(os.path.join(path, 'valid.txt.raw'), sega=sega, sent_eos=sent_eos, char_level=True)
-            self.vocab.count_file(os.path.join(path, 'test.txt.raw'), sega=sega, sent_eos=sent_eos, char_level=True)
+            self.vocab.count_file(os.path.join(
+                path, 'train.txt.raw'), sega=sega, sent_eos=sent_eos, char_level=True)
+            self.vocab.count_file(os.path.join(
+                path, 'valid.txt.raw'), sega=sega, sent_eos=sent_eos, char_level=True)
+            self.vocab.count_file(os.path.join(
+                path, 'test.txt.raw'), sega=sega, sent_eos=sent_eos, char_level=True)
         elif self.dataset == 'wt103':
-            self.vocab.count_file(os.path.join(path, 'train.txt'),sega=sega,sent_eos=sent_eos)
+            self.vocab.count_file(os.path.join(
+                path, 'train.txt'), sega=sega, sent_eos=sent_eos)
 
         elif self.dataset == 'lm1b':
             train_path_pattern = os.path.join(
@@ -218,7 +229,7 @@ class Corpus(object):
         self.vocab.build_vocab()
 
         if self.dataset in ['ptb', 'wt2', 'wt103']:
-            self.train = self.vocab.encode_file( 
+            self.train = self.vocab.encode_file(
                 os.path.join(path, 'train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
             self.valid = self.vocab.encode_file(
                 os.path.join(path, 'valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
@@ -229,13 +240,13 @@ class Corpus(object):
                 os.path.join(path, 'train.txt.raw'), ordered=True, add_eos=False, char_level=True)
             self.valid = self.vocab.encode_file(
                 os.path.join(path, 'valid.txt.raw'), ordered=True, add_eos=False, char_level=True)
-            self.test  = self.vocab.encode_file(
+            self.test = self.vocab.encode_file(
                 os.path.join(path, 'test.txt.raw'), ordered=True, add_eos=False, char_level=True)
         elif self.dataset == 'lm1b':
             self.train = train_paths
             self.valid = self.vocab.encode_file(
                 os.path.join(path, 'valid.txt'), ordered=False, add_double_eos=True)
-            self.test  = self.vocab.encode_file(
+            self.test = self.vocab.encode_file(
                 os.path.join(path, 'test.txt'), ordered=False, add_double_eos=True)
 
     def get_iterator(self, split, *args, **kwargs):
@@ -244,7 +255,8 @@ class Corpus(object):
                 data_iter = LMOrderedIterator(self.train, *args, **kwargs)
             elif self.dataset == 'lm1b':
                 kwargs['shuffle'] = True
-                data_iter = LMMultiFileIterator(self.train, self.vocab, *args, **kwargs)
+                data_iter = LMMultiFileIterator(
+                    self.train, self.vocab, *args, **kwargs)
         elif split in ['valid', 'test']:
             data = self.valid if split == 'valid' else self.test
             if self.dataset in ['ptb', 'wt2', 'wt103', 'enwik8', 'text8']:
@@ -254,39 +266,6 @@ class Corpus(object):
         elif split == 'train_cl':
             data_iter = LMOrderedIterator(self.train_cl, *args, **kwargs)
         return data_iter
-
-def get_lm_corpus(args):
-    corpus = None
-    print('Producing dataset {} with rank {}'.format(args.dataset, args.rank))
-    kwargs = {}
-    if args.dataset in ['wt103']:
-        kwargs['special'] = ['<eos>','<sent_eos>']
-        kwargs['lower_case'] = False
-    else:
-        raise NotImplementedError
-    fn = os.path.join(args.data, 'cache.pt')
-    if os.path.exists(fn):
-        print('Loading cached dataset...')
-        corpus = torch.load(fn)
-    else:
-        corpus = MixCorpus(args, **kwargs)
-        torch.save(corpus, fn)
-    ntokens = torch.cuda.LongTensor([len(corpus.vocab)])
-    cl_root_tokens = torch.cuda.LongTensor(corpus.vocab.cl_root_tokens)
-    cl_leaf_tokens = torch.cuda.LongTensor(corpus.vocab.cl_leaf_tokens)
-
-    # torch.distributed.broadcast(ntokens, mpu.get_model_parallel_src_rank(),
-    #                             group=mpu.get_data_parallel_group())
-    # torch.distributed.broadcast(cl_root_tokens, mpu.get_model_parallel_src_rank(),
-    #                             group=mpu.get_data_parallel_group())
-    # torch.distributed.broadcast(cl_leaf_tokens, mpu.get_model_parallel_src_rank(),
-    #                             group=mpu.get_data_parallel_group())
-
-    args.n_token = ntokens.item()
-    args.cl_all_root_index = cl_root_tokens.tolist()
-    args.cl_all_leaf_index =  cl_leaf_tokens.tolist()
-    
-    return corpus
 
 
 class MixLMOrderedIterator(LMOrderedIterator):
@@ -302,12 +281,11 @@ class MixLMOrderedIterator(LMOrderedIterator):
         self.bsz = bsz*self.world_size
         self.bptt = bptt
         self.ext_len = ext_len if ext_len is not None else 0
-        self.sega =  isinstance(data, tuple)
+        self.sega = isinstance(data, tuple)
         self.device = device
         self.cl_portion = cl_portion*100
         if self.sega:
-            data,p,s,t = data
-        assert data.size(0) == data_cl.size(0)
+            data, p, s, t = data
         # Work out how cleanly we can divide the dataset into bsz parts.
         self.n_step = data.size(0) // self.bsz
 
@@ -315,7 +293,7 @@ class MixLMOrderedIterator(LMOrderedIterator):
         data = data.narrow(0, 0, self.n_step * self.bsz)
         # Evenly divide the data across the bsz batches.
         self.data = data.view(self.bsz, -1).t().contiguous().to(device)
-        data_cl = data_cl.narrow(0,0,self.n_step*self.bsz)
+        data_cl = data_cl.narrow(0, 0, self.n_step*self.bsz)
         self.data_cl = data_cl.view(self.bsz, -1).t().contiguous().to(device)
         # if self.sega:
         #     p = p.narrow(0, 0, self.n_step * bsz)
@@ -326,11 +304,10 @@ class MixLMOrderedIterator(LMOrderedIterator):
         #     self.t = t.view(bsz, -1).t().contiguous().to(device)
         # Number of mini-batches
         self.n_batch = (self.n_step + self.bptt - 1) // self.bptt
-    
 
     def get_batch(self, i):
         #if bptt is None: bptt = self.bptt
-        i = i%self.n_batch
+        i = i % self.n_batch
         seq_len = min(self.bptt, self.data.size(0) - 1 - i)
         # while i+seq_len >= self.data.size(0):
         #     i = max(0, i-self.data.size(0))
@@ -348,7 +325,7 @@ class MixLMOrderedIterator(LMOrderedIterator):
         # if self.sega:
         #     pst = (self.p[beg_idx:end_idx], self.s[beg_idx:end_idx],self.t[beg_idx:end_idx])
         # return data, target, cl_data, cl_target
-        return {'input':data, 'target':target, 'cl_input':cl_data, 'cl_target':cl_target}
+        return {'input': data, 'target': target, 'cl_input': cl_data, 'cl_target': cl_target}
 
     def get_fixlen_iter(self, start=0):
         for i in range(start, self.data.size(0) - 1, self.bptt):
@@ -377,31 +354,40 @@ class MixLMOrderedIterator(LMOrderedIterator):
     def __len__(self):
         return self.n_batch
 
+
 class MixCorpus(object):
     def __init__(self, args, *_args, **kwargs):
         path, dataset, sega, sent_eos = args.data, args.dataset, args.sega, args.sent_eos
         self.dataset = dataset
         self.vocab = Vocab(*_args, **kwargs)
         self.add_sent_eos = sent_eos
-
-        self.vocab.count_file(os.path.join(path, 'train.txt'),sega=sega,sent_eos=sent_eos)
-        self.vocab.count_cl_file(os.path.join(path, 'cl-train.txt'),sega=sega,sent_eos=sent_eos)
-        self.vocab.build_vocab()
-
-        self.train_cl = self.vocab.encode_file( 
-        os.path.join(path, 'cl-train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
-        self.train = self.vocab.encode_file( 
+        self.vocab.count_file(os.path.join(
+            path, 'train.txt'), sega=sega, sent_eos=sent_eos)
+        self.vocab.get_wn_replaced_dict(synset_layer=args.wn_layer)
+        if args.adaptive_class_softmax:
+            self.vocab.build_vocab_with_cl_order()
+        else:
+            self.vocab.build_vocab()
+        self.train, self.train_cl = self.vocab.encode_file_plus(
             os.path.join(path, 'train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
-        # self.train = self.train[args.rank*(self.train.size(0)//args.world_size): (args.rank+1)*(self.train.size(0)//args.world_size)]
-        # self.train_cl = self.train_cl[args.rank*(self.train_cl.size(0)//args.world_size): (args.rank+1)*(self.train_cl.size(0)//args.world_size)]
-        self.valid = self.vocab.encode_file(
+        self.valid, self.valid_cl = self.vocab.encode_file_plus(
             os.path.join(path, 'valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
-        self.valid_cl = self.vocab.encode_file( 
-        os.path.join(path, 'cl-valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
-        self.test = self.vocab.encode_file(
+        self.test, self.test_cl = self.vocab.encode_file_plus(
             os.path.join(path, 'test.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
-        self.test_cl = self.vocab.encode_file( 
-        os.path.join(path, 'cl-test.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        # self.vocab.count_cl_file(os.path.join(path, 'cl-train.txt'),sega=sega,sent_eos=sent_eos)
+        # self.vocab.build_vocab()
+        # self.train_cl = self.vocab.encode_file(
+        # os.path.join(path, 'cl-train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        # self.train = self.vocab.encode_file(
+        #     os.path.join(path, 'train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        # self.valid = self.vocab.encode_file(
+        #     os.path.join(path, 'valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        # self.valid_cl = self.vocab.encode_file(
+        # os.path.join(path, 'cl-valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        # self.test = self.vocab.encode_file(
+        #     os.path.join(path, 'test.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        # self.test_cl = self.vocab.encode_file(
+        # os.path.join(path, 'cl-test.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
 
     def get_iterator(self, split, *args, **kwargs):
         if split == 'train':
@@ -417,16 +403,3 @@ class MixCorpus(object):
         #     data = self.valid if split == 'valid' else self.test
         #     data_iter = LMOrderedIterator(data, *args, **kwargs)
         return data_iter
-
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='unit test')
-    parser.add_argument('--datadir', type=str, default='../data/text8',
-                        help='location of the data corpus')
-    parser.add_argument('--dataset', type=str, default='text8',
-                        choices=['ptb', 'wt2', 'wt103', 'lm1b', 'enwik8', 'text8'],
-                        help='dataset name')
-    args = parser.parse_args()
-
-    corpus = get_lm_corpus(args.datadir, args.dataset)
-    print('Vocab size : {}'.format(len(corpus.vocab.idx2sym)))

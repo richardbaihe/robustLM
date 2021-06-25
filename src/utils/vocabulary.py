@@ -1,8 +1,10 @@
 import os
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, defaultdict
 
 import torch
 import nltk
+from nltk.corpus import wordnet as wn
+
 
 class Vocab(object):
     def __init__(self, special=[], min_freq=0, max_size=None, lower_case=True,
@@ -16,8 +18,10 @@ class Vocab(object):
         self.vocab_file = vocab_file
         self.cl_root_tokens = []
         self.cl_leaf_tokens = []
+        self.word2class = {}
+        self.class2words = defaultdict(list)
 
-    def tokenize(self, line, add_eos=False, add_double_eos=False, add_sent_eos=False,char_level=False):
+    def tokenize(self, line, add_eos=False, add_double_eos=False, add_sent_eos=False, char_level=False):
         line = line.strip()
         if char_level:
             line = ' '.join([str(ord(c)) for c in line])
@@ -31,15 +35,16 @@ class Vocab(object):
             symbols = line.split(self.delimiter)
         if add_sent_eos:
             symbols = symbols + ['<sent_eos>']
-        if add_double_eos: # lm1b
+        if add_double_eos:  # lm1b
             return ['<S>'] + symbols + ['<S>']
         elif add_eos:
             return symbols + ['<eos>']
         else:
             return symbols
 
-    def count_file(self, path, verbose=False, add_eos=False,sega=False,sent_eos=False,char_level=False):
-        if verbose: print('counting file {} ...'.format(path))
+    def count_file(self, path, verbose=False, add_eos=False, sega=False, sent_eos=False, char_level=False):
+        if verbose:
+            print('counting file {} ...'.format(path))
         assert os.path.exists(path)
 
         with open(path, 'r', encoding='utf-8') as f:
@@ -49,14 +54,17 @@ class Vocab(object):
                 if sega:
                     nltk_sents = nltk.tokenize.sent_tokenize(line)
                     for sent in nltk_sents:
-                        symbols = self.tokenize(sent, add_eos=add_eos,add_sent_eos=sent_eos,char_level=char_level)
+                        symbols = self.tokenize(
+                            sent, add_eos=add_eos, add_sent_eos=sent_eos, char_level=char_level)
                         self.counter.update(symbols)
                 else:
-                    symbols = self.tokenize(line, add_eos=add_eos,add_sent_eos=sent_eos,char_level=char_level)
+                    symbols = self.tokenize(
+                        line, add_eos=add_eos, add_sent_eos=sent_eos, char_level=char_level)
                     self.counter.update(symbols)
 
-    def count_cl_file(self, path, verbose=False, add_eos=False, sega=False,sent_eos=False,char_level=False):
-        if verbose: print('counting cl file {} ...'.format(path))
+    def count_cl_file(self, path, verbose=False, add_eos=False, sega=False, sent_eos=False, char_level=False):
+        if verbose:
+            print('counting cl file {} ...'.format(path))
         if not os.path.exists(path):
             print("found no cl files to count")
             return
@@ -65,12 +73,12 @@ class Vocab(object):
             for idx, line in enumerate(f):
                 if verbose and idx > 0 and idx % 500000 == 0:
                     print('    line {}'.format(idx))
-                symbols = self.tokenize(line, add_eos=add_eos,add_sent_eos=sent_eos,char_level=char_level)
+                symbols = self.tokenize(
+                    line, add_eos=add_eos, add_sent_eos=sent_eos, char_level=char_level)
                 temp_counter.update(symbols)
         self.cl_root_tokens = list((temp_counter-self.counter).keys())
         self.cl_leaf_tokens = list((self.counter-temp_counter).keys())
         self.counter = self.counter | temp_counter
-        
 
     def _build_from_file(self, vocab_file):
         self.idx2sym = []
@@ -97,18 +105,81 @@ class Vocab(object):
                 self.add_special(sym)
 
             for sym, cnt in self.counter.most_common(self.max_size):
-                if cnt < self.min_freq: break
+                if cnt < self.min_freq:
+                    break
                 self.add_symbol(sym)
 
             print('final vocab size {} from {} unique tokens'.format(
                 len(self), len(self.counter)))
         if self.cl_root_tokens:
-            self.cl_root_tokens = [self.get_idx(sym) for sym in self.cl_root_tokens]
-            self.cl_leaf_tokens = [self.get_idx(sym) for sym in self.cl_leaf_tokens]
+            self.cl_root_tokens = [self.get_idx(
+                sym) for sym in self.cl_root_tokens]
+            self.cl_leaf_tokens = [self.get_idx(
+                sym) for sym in self.cl_leaf_tokens]
+
+    def build_vocab_with_cl_order(self):
+        self.idx2sym = []
+        self.sym2idx = OrderedDict()
+
+        for sym in self.cl_root_tokens:
+            self.add_symbol(sym)
+
+        for sym in self.special:
+            self.add_special(sym)
+
+        add_leaf_flag = True
+        for sym, cnt in self.counter.most_common(self.max_size):
+            if cnt < self.min_freq:
+                break
+            if add_leaf_flag and len(self.idx2sym) == 20000:
+                for _sym in self.cl_leaf_tokens:
+                    self.add_symbol(_sym)
+                add_leaf_flag = False
+            if add_leaf_flag and sym in self.cl_leaf_tokens:
+                continue
+            self.add_symbol(sym)
+
+        print('final vocab size {} from {} unique tokens'.format(
+            len(self), len(self.counter)))
+        if self.cl_root_tokens:
+            self.cl_root_tokens = [self.get_idx(
+                sym) for sym in self.cl_root_tokens]
+            self.cl_leaf_tokens = [self.get_idx(
+                sym) for sym in self.cl_leaf_tokens]
+
+    def get_wn_replaced_dict(self, synset_layer=4, ignore_freqency_threshold=6000):
+        for k, cnt in self.counter.most_common(self.max_size):
+            if cnt >= ignore_freqency_threshold:
+                continue
+            if cnt < self.min_freq:
+                break
+            continue_for_k = True
+            for synset in wn.synsets(k):
+                paths = synset.hypernym_paths()
+                for path in paths:
+                    if len(path) < synset_layer+1:
+                        continue
+                    else:
+                        if '.n.' not in path[synset_layer].name():
+                            continue
+                        self.class2words[path[synset_layer].name()].append(
+                            k)
+                        self.word2class[k] = path[synset_layer].name()
+                        self.counter.update([path[synset_layer].name()])
+                        continue_for_k = False
+                        break
+                if not continue_for_k:
+                    break
+        for k, v in self.class2words.items():
+            self.cl_root_tokens.append(k)
+            self.cl_leaf_tokens.extend(v)
+        # self.vocab.cl_root_tokens = list(self.vocab.class2words.keys())
+        # self.vocab.cl_leaf_tokens = list(self.vocab.word2class.keys())
 
     def encode_file(self, path, ordered=False, verbose=False, add_eos=True,
-            add_double_eos=False,add_sent_eos=False):
-        if verbose: print('encoding file {} ...'.format(path))
+                    add_double_eos=False, add_sent_eos=False):
+        if verbose:
+            print('encoding file {} ...'.format(path))
         assert os.path.exists(path)
         encoded = []
         with open(path, 'r', encoding='utf-8') as f:
@@ -116,7 +187,7 @@ class Vocab(object):
                 if verbose and idx > 0 and idx % 500000 == 0:
                     print('    line {}'.format(idx))
                 symbols = self.tokenize(line, add_eos=add_eos,
-                    add_double_eos=add_double_eos, add_sent_eos=add_sent_eos)
+                                        add_double_eos=add_double_eos, add_sent_eos=add_sent_eos)
                 encoded.append(self.convert_to_tensor(symbols))
 
         if ordered:
@@ -124,8 +195,32 @@ class Vocab(object):
 
         return encoded
 
+    def encode_file_plus(self, path, ordered=False, verbose=False, add_eos=True,
+                         add_double_eos=False, add_sent_eos=False):
+        if verbose:
+            print('encoding file {} ...'.format(path))
+        assert os.path.exists(path)
+        encoded = []
+        encoded_cl = []
+        with open(path, 'r', encoding='utf-8') as f:
+            for idx, line in enumerate(f):
+                if verbose and idx > 0 and idx % 500000 == 0:
+                    print('    line {}'.format(idx))
+                symbols = self.tokenize(line, add_eos=add_eos,
+                                        add_double_eos=add_double_eos, add_sent_eos=add_sent_eos)
+                cl_symbols = [self.word2class[x]
+                              if x in self.word2class else x for x in symbols]
+                encoded.append(self.convert_to_tensor(symbols))
+                encoded_cl.append(self.convert_to_tensor(cl_symbols))
+        if ordered:
+            encoded = torch.cat(encoded)
+            encoded_cl = torch.cat(encoded_cl)
+
+        return encoded, encoded_cl
+
     def encode_sents(self, sents, ordered=False, verbose=False):
-        if verbose: print('encoding {} sents ...'.format(len(sents)))
+        if verbose:
+            print('encoding {} sents ...'.format(len(sents)))
         encoded = []
         for idx, symbols in enumerate(sents):
             if verbose and idx > 0 and idx % 500000 == 0:
@@ -192,8 +287,9 @@ class SegaVocab(Vocab):
         self.vocab_file = vocab_file
 
     def encode_file(self, path, ordered=False, verbose=False, add_eos=True,
-            add_double_eos=False, add_sent_eos=False, char_level=False):
-        if verbose: print('encoding file {} ...'.format(path))
+                    add_double_eos=False, add_sent_eos=False, char_level=False):
+        if verbose:
+            print('encoding file {} ...'.format(path))
         assert os.path.exists(path)
         encoded = []
         p = []
@@ -213,19 +309,20 @@ class SegaVocab(Vocab):
                 para_pos = []
                 sent_pos = []
                 token_pos = []
-                for i,sent in enumerate(sents):
+                for i, sent in enumerate(sents):
                     if i == len(sents)-1:
-                        sent_symbol = self.tokenize(sent,add_eos=add_eos,add_double_eos=add_double_eos,
-                                                    add_sent_eos=add_sent_eos,char_level=char_level)
+                        sent_symbol = self.tokenize(sent, add_eos=add_eos, add_double_eos=add_double_eos,
+                                                    add_sent_eos=add_sent_eos, char_level=char_level)
                     else:
-                        sent_symbol = self.tokenize(sent,add_sent_eos=add_sent_eos,char_level=char_level)
+                        sent_symbol = self.tokenize(
+                            sent, add_sent_eos=add_sent_eos, char_level=char_level)
                     symbols.extend(sent_symbol)
                     para_pos.extend([index_p]*len(sent_symbol))
                     sent_pos.extend([index_s]*len(sent_symbol))
-                    token_pos.extend(range(index_t,index_t+len(sent_symbol)))
-                    index_s+=1
-                    index_t+=len(sent_symbol)
-                index_p+=1
+                    token_pos.extend(range(index_t, index_t+len(sent_symbol)))
+                    index_s += 1
+                    index_t += len(sent_symbol)
+                index_p += 1
                 # symbols = self.tokenize(line, add_eos=add_eos,
                 #     add_double_eos=add_double_eos)
                 encoded.append(self.convert_to_tensor(symbols))
@@ -239,4 +336,4 @@ class SegaVocab(Vocab):
             s = torch.cat(s)
             t = torch.cat(t)
 
-        return (encoded,p,s,t)
+        return (encoded, p, s, t)

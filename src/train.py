@@ -22,7 +22,7 @@ from apex.optimizers import FusedAdam as Adam
 from apex import amp, optimizers
 from apex import amp, optimizers
 from utils.arguments import get_args
-from data_utils import get_lm_corpus
+from data_utils import MixCorpus
 from utils.exp_utils import create_exp_dir, \
     print_rank_0, save_checkpoint, load_checkpoint, get_params_for_weight_decay_optimization
 from mem_transformer import MemTransformerLM, SegaMemTransformerLM
@@ -65,6 +65,28 @@ def set_random_seed(seed):
         np.random.seed(seed)
         torch.manual_seed(seed)
         # mpu.model_parallel_cuda_manual_seed(seed)
+
+
+def get_lm_corpus(args):
+    corpus = None
+    kwargs = {}
+    if args.dataset in ['wt103']:
+        kwargs['special'] = ['<eos>', '<sent_eos>']
+        kwargs['lower_case'] = False
+    else:
+        raise NotImplementedError
+    fn = os.path.join(args.data, 'cache.pt')
+    print('Producing dataset {} with rank {}'.format(args.dataset, args.rank))
+    corpus = MixCorpus(args, **kwargs)
+    #torch.save(corpus, fn)
+    ntokens = torch.cuda.LongTensor([len(corpus.vocab)])
+    # cl_root_tokens = torch.cuda.LongTensor(corpus.vocab.cl_root_tokens)
+    # cl_leaf_tokens = torch.cuda.LongTensor(corpus.vocab.cl_leaf_tokens)
+    args.n_token = ntokens.item()
+    args.cl_all_root_index = corpus.vocab.cl_root_tokens
+    args.cl_all_leaf_index = corpus.vocab.cl_leaf_tokens
+    args.cl_root_leaf_dict = corpus.vocab.class2words
+    return corpus
 
 def get_model(args):
     device = torch.device('cuda' if args.cuda else 'cpu')
@@ -161,7 +183,8 @@ def get_model(args):
                 ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
                 same_length=args.same_length, attn_type=args.attn_type,
                 clamp_len=args.clamp_len, sample_softmax=args.sample_softmax, 
-                cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index)
+                cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index,
+                                     adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict)
         model.apply(weights_init)
         model.word_emb.apply(weights_init) # ensure embedding init is not overridden by out_layer in case of weight sharing
 
@@ -252,29 +275,28 @@ def forward_step(data_iterator, model, mems, iteration, args):
     data, target, cl_data, cl_target = get_batch(data_iterator,iteration)
     root_mask = cl_target!=target
     input_root = args.input_root and class_prediction
-    assert not (args.mix_vocab and args.multi_obj), "if predicted with multi-objective, can't set mix_vocab=True"
     if class_prediction:
         if input_root:
-            ret = model(cl_data, target, cl_target, mems, class_prediction=True, multi_obj=args.multi_obj, mix_vocab=args.mix_vocab)
+            ret = model(cl_data, target, cl_target, mems, args, class_prediction=True)
         else:
-            ret = model(data, target, cl_target, mems, class_prediction=True, multi_obj=args.multi_obj, mix_vocab=args.mix_vocab)
+            ret = model(data, target, cl_target, mems, args, class_prediction=True)
     else:
-        ret = model(data, target, cl_target, mems, mix_vocab=args.mix_vocab)
+        ret = model(data, target, cl_target, mems, args)
     # ret = model(data, target, cl_data, cl_target, mems, class_prediction, input_root)
-    lm_loss, auxilary_loss, new_mems = ret[0], ret[1], ret[2:]
+    lm_loss, auxiliary_loss, new_mems = ret[0], ret[1], ret[2:]
     if eval_cl_loss:
         if args.input_root:
-            ret = model(cl_data, target, cl_target, mems, class_prediction=True, multi_obj=args.multi_obj, mix_vocab=args.mix_vocab)
+            ret = model(cl_data, target, cl_target, mems, args, class_prediction=True)
         else:
-            ret = model(data, target, cl_target, mems, class_prediction=True, multi_obj=args.multi_obj, mix_vocab=args.mix_vocab)
-        auxilary_loss = ret[1]
+            ret = model(data, target, cl_target, mems, args, class_prediction=True)
+        auxiliary_loss = ret[1]
     cl_loss = lm_loss[root_mask]
     non_cl_loss = lm_loss[~root_mask]
-    return lm_loss, auxilary_loss, cl_loss, non_cl_loss, new_mems
+    return lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems
 
-def backward_step(optimizer, model, lm_loss, auxilary_loss, args):
+def backward_step(optimizer, model, lm_loss, auxiliary_loss, args):
     if args.multi_obj:
-        loss = 0.8*lm_loss + 0.2*auxilary_loss
+        loss = 0.8*lm_loss + 0.2*auxiliary_loss
     else:
         loss = lm_loss
     optimizer.zero_grad()
@@ -286,21 +308,21 @@ def backward_step(optimizer, model, lm_loss, auxilary_loss, args):
         loss.backward()
     
     lm_loss_reduced = get_reduced_loss(lm_loss, args.world_size)
-    auxilary_loss_reduced = get_reduced_loss(auxilary_loss, args.world_size)
+    auxiliary_loss_reduced = get_reduced_loss(auxiliary_loss, args.world_size)
 
     if args.fp16:
         torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
     else:
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
 
-    return lm_loss_reduced, auxilary_loss_reduced
+    return lm_loss_reduced, auxiliary_loss_reduced
 
 def train_step(data_iterator, mems, model, optimizer, lr_scheduler, iteration, args):
 
-    lm_loss, auxilary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
+    lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
     lm_loss = lm_loss.float().mean().type_as(lm_loss)
-    auxilary_loss = auxilary_loss.float().mean().type_as(auxilary_loss)
-    lm_loss_reduced, auxilary_loss_reduced = backward_step(optimizer, model, lm_loss, auxilary_loss, args)
+    auxiliary_loss = auxiliary_loss.float().mean().type_as(auxiliary_loss)
+    lm_loss_reduced, auxiliary_loss_reduced = backward_step(optimizer, model, lm_loss, auxiliary_loss, args)
     optimizer.step()
 
     if iteration < args.warmup_step:
@@ -314,7 +336,7 @@ def train_step(data_iterator, mems, model, optimizer, lr_scheduler, iteration, a
     cl_lm_loss_reduced = get_reduced_loss(cl_loss,args.world_size)
     non_cl_lm_loss_reduced = get_reduced_loss(non_cl_loss,args.world_size)
 
-    return lm_loss_reduced, auxilary_loss_reduced, cl_lm_loss_reduced, non_cl_lm_loss_reduced, new_mems
+    return lm_loss_reduced, auxiliary_loss_reduced, cl_lm_loss_reduced, non_cl_lm_loss_reduced, new_mems
 
 def train(model, optimizer, lr_scheduler, train_data_iterator, val_data_iterator, args):
     # Turn on training mode which enables dropout.
@@ -323,18 +345,18 @@ def train(model, optimizer, lr_scheduler, train_data_iterator, val_data_iterator
     total_lm_loss = 0.0
     total_cl_lm_loss = 0.0
     total_non_cl_lm_loss = 0.0
-    total_auxilary_loss = 0.0
+    total_auxiliary_loss = 0.0
     best_val_ppl = math.inf
     mems = tuple()
     iteration = args.iteration
     log_start_time = time.time()
     while iteration < args.max_step:
-        lm_loss, auxilary_loss, cl_loss, non_cl_loss, mems = train_step(train_data_iterator, mems, model, optimizer, lr_scheduler, iteration, args)
+        lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = train_step(train_data_iterator, mems, model, optimizer, lr_scheduler, iteration, args)
         iteration += 1
         current_lm_loss = lm_loss.data.detach().float().item()
         total_lm_loss += current_lm_loss
-        current_auxilary_loss = auxilary_loss.data.detach().float().item()
-        total_auxilary_loss += current_auxilary_loss
+        current_auxiliary_loss = auxiliary_loss.data.detach().float().item()
+        total_auxiliary_loss += current_auxiliary_loss
         current_cl_lm_loss = cl_loss.data.detach().float().item()
         total_cl_lm_loss += current_cl_lm_loss
         current_non_cl_lm_loss = non_cl_loss.data.detach().float().item()
@@ -344,14 +366,14 @@ def train(model, optimizer, lr_scheduler, train_data_iterator, val_data_iterator
         if args.rank == 0:
             log_dict = {"train/lr": learning_rate, "train/lm_loss": current_lm_loss, 
             "train/cl_lm_loss": current_cl_lm_loss, "train/non_cl_lm_loss": current_non_cl_lm_loss, 
-            "train/auxilary_loss":current_auxilary_loss}
+            "train/auxiliary_loss":current_auxiliary_loss}
             wandb.log(log_dict,step=iteration)
         if iteration % args.log_interval == 0:
             elapsed = time.time() - log_start_time
             avg_lm_loss = total_lm_loss / args.log_interval
             avg_cl_lm_loss = total_cl_lm_loss / args.log_interval
             avg_non_cl_lm_loss = total_non_cl_lm_loss / args.log_interval
-            avg_auxilary_loss = total_auxilary_loss / args.log_interval
+            avg_auxiliary_loss = total_auxiliary_loss / args.log_interval
             if args.rank == 0:
                 epoch = iteration//train_data_iterator.n_batch
                 log_str = '| epoch {:3d} step {:>8d} | ms/batch {:5.2f} |  lr {:.3g} | loss {:5.2f}'.format(
@@ -359,11 +381,11 @@ def train(model, optimizer, lr_scheduler, train_data_iterator, val_data_iterator
                 log_start_time = time.time()
                 print_rank_0(log_str)
                 wandb.log({"train_avg/lm_loss": avg_lm_loss, "train_avg/cl_lm_loss":avg_cl_lm_loss,
-                "train_avg/non_cl_lm_loss":avg_non_cl_lm_loss, "train_avg/auxilary_loss":avg_auxilary_loss}, step=iteration)
+                "train_avg/non_cl_lm_loss":avg_non_cl_lm_loss, "train_avg/auxiliary_loss":avg_auxiliary_loss}, step=iteration)
             total_lm_loss = 0
             total_cl_lm_loss = 0
             total_non_cl_lm_loss = 0
-            total_auxilary_loss = 0
+            total_auxiliary_loss = 0
         if iteration % args.save_interval == 0 :
             save_checkpoint(iteration, model, optimizer, lr_scheduler, args, best=False)
         if iteration % args.eval_interval == 0:
@@ -394,14 +416,14 @@ def evaluate(data_iterator, model, args):
     total_lm_len, total_lm_loss = 0, 0.
     total_cl_len, total_cl_loss = 0, 0.
     total_non_cl_len, total_non_cl_loss = 0, 0.
-    total_auxilary_len, total_auxilary_loss = 0, 0.
+    total_auxiliary_len, total_auxiliary_loss = 0, 0.
     with torch.no_grad():
         mems = tuple()
         for iteration in range(data_iterator.n_batch):
             if args.max_eval_steps > 0 and iteration >= args.max_eval_steps:
                 total_len = args.max_eval_steps*args.eval_tgt_len
                 break
-            lm_loss, auxilary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
+            lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
 
             seq_len = lm_loss.size()[0]
             total_lm_len += seq_len
@@ -409,7 +431,7 @@ def evaluate(data_iterator, model, args):
             cl_seq_len = torch.numel(cl_loss)/data_iterator.bsz
             total_cl_len += cl_seq_len
             total_cl_loss += cl_loss.mean().float().item()*cl_seq_len
-            total_auxilary_loss += auxilary_loss.mean().float().item()*cl_seq_len
+            total_auxiliary_loss += auxiliary_loss.mean().float().item()*cl_seq_len
             non_cl_seq_len = seq_len-cl_seq_len
             total_non_cl_len += non_cl_seq_len
             total_non_cl_loss += non_cl_loss.mean().float().item()*non_cl_seq_len
@@ -419,34 +441,34 @@ def evaluate(data_iterator, model, args):
     model.reset_length(args.tgt_len, args.ext_len, args.mem_len)
     model.train()
 
-    return total_lm_loss / total_lm_len, total_auxilary_loss / total_cl_len,\
+    return total_lm_loss / total_lm_len, total_auxiliary_loss / total_cl_len,\
          total_cl_loss / total_cl_len, total_non_cl_loss / total_non_cl_len
 
 def evaluate_and_print_results(data_iterator, model, args, iteration):
     model.eval()
     eval_start_time = time.time()
-    lm_loss, auxilary_loss, cl_lm_loss, non_cl_lm_loss = evaluate(data_iterator, model, args)
+    lm_loss, auxiliary_loss, cl_lm_loss, non_cl_lm_loss = evaluate(data_iterator, model, args)
     val_lm_ppl, val_cl_ppl, val_non_cl_ppl = math.exp(lm_loss), math.exp(cl_lm_loss), math.exp(non_cl_lm_loss)
     if args.rank == 0:
         log_str = '| Eval {:3d} at step {:>8d} |  time: {:5.2f}s | valid loss {:5.2f} | auxiliary loss {:5.2f} | valid ppl {:5.2f}'.format(
                 iteration // args.eval_interval, iteration, (time.time() - eval_start_time),
-                 lm_loss, auxilary_loss, val_lm_ppl)
+                 lm_loss, auxiliary_loss, val_lm_ppl)
         print_rank_0(log_str)
-        wandb.log({"valid/ppl": val_lm_ppl, "valid/cl_ppl": val_cl_ppl, "valid/non_cl_ppl": val_non_cl_ppl, "valid/auxilary_loss":auxilary_loss}, step=iteration)
+        wandb.log({"valid/ppl": val_lm_ppl, "valid/cl_ppl": val_cl_ppl, "valid/non_cl_ppl": val_non_cl_ppl, "valid/auxiliary_loss":auxiliary_loss}, step=iteration)
     model.train()
     return val_lm_ppl
 
 def test(data_iterator, model, args, iteration):
     model.eval()
     eval_start_time = time.time()
-    lm_loss, auxilary_loss, cl_lm_loss, non_cl_lm_loss = evaluate(data_iterator, model, args)
+    lm_loss, auxiliary_loss, cl_lm_loss, non_cl_lm_loss = evaluate(data_iterator, model, args)
     val_lm_ppl, val_cl_ppl, val_non_cl_ppl = math.exp(lm_loss), math.exp(cl_lm_loss), math.exp(non_cl_lm_loss)
     if args.rank == 0:
         log_str = '| Test at step {:>8d} |  time: {:5.2f}s | test loss {:5.2f} | auxiliary loss {:5.2f} | test ppl {:5.2f}'.format(
                 iteration, (time.time() - eval_start_time),
-                 lm_loss, auxilary_loss, val_lm_ppl)
+                 lm_loss, auxiliary_loss, val_lm_ppl)
         print_rank_0(log_str)
-        wandb.log({"test/ppl": val_lm_ppl, "test/cl_ppl": val_cl_ppl, "test/non_cl_ppl": val_non_cl_ppl, "test/auxilary_loss":auxilary_loss})
+        wandb.log({"test/ppl": val_lm_ppl, "test/cl_ppl": val_cl_ppl, "test/non_cl_ppl": val_non_cl_ppl, "test/auxiliary_loss":auxiliary_loss})
     model.train()
     return val_lm_ppl
 
@@ -482,19 +504,17 @@ def main():
         train(model, optimizer, scheduler, tr_iter, va_iter, args)
     if args.do_eval and args.checkpoint_dir:
         for checkpoint_name in glob.glob(os.path.join(args.checkpoint_dir,'iter_*/model_optim_rng.pt')):
+            iteration = load_checkpoint(model, optimizer, scheduler, args, checkpoint_name=checkpoint_name)
             if args.rank == 0:
-                iteration = load_checkpoint(model, optimizer, scheduler, args, checkpoint_name=checkpoint_name)
                 evaluate_and_print_results(va_iter, model, args, iteration=iteration)
             torch.distributed.barrier()
     if args.do_test:
         checkpoint_name = ""
         if args.checkpoint_dir:
             checkpoint_name = os.path.join(args.checkpoint_dir,'best/model_optim_rng.pt')
+        iteration = load_checkpoint(model, optimizer, scheduler, args, best=True, checkpoint_name=checkpoint_name)
         if args.rank == 0:
-            iteration = load_checkpoint(model, optimizer, scheduler, args, best=True, checkpoint_name=checkpoint_name)
             test(te_iter, model, args, iteration=iteration)
-        torch.distributed.barrier()
-    # vocab parallel
 
 if __name__ == "__main__":
     main()

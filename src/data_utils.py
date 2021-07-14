@@ -361,9 +361,17 @@ class MixCorpus(object):
         self.dataset = dataset
         self.vocab = Vocab(*_args, **kwargs)
         self.add_sent_eos = sent_eos
+        self.path = path
         self.vocab.count_file(os.path.join(
             path, 'train.txt'), sega=sega, sent_eos=sent_eos)
-        self.vocab.get_wn_replaced_dict(synset_layer=args.wn_layer)
+        if args.dynamic_wn_layer_start_from>0:
+            self.vocab.get_wn_replaced_dict_list(
+                min_synset_layer=args.dynamic_wn_layer_start_from, max_synset_layer=args.wn_layer)
+            self.vocab.word2class = self.vocab.word2class_dict[args.wn_layer]
+        else:
+            self.vocab.get_wn_replaced_dict(
+                synset_layer=args.wn_layer, ignore_freqency_threshold=args.ignore_freqency_threshold,
+                min_tokens_per_hypernym=args.min_tokens_per_hypernym)
         if args.adaptive_class_softmax:
             self.vocab.build_vocab_with_cl_order()
         else:
@@ -374,20 +382,6 @@ class MixCorpus(object):
             os.path.join(path, 'valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
         self.test, self.test_cl = self.vocab.encode_file_plus(
             os.path.join(path, 'test.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
-        # self.vocab.count_cl_file(os.path.join(path, 'cl-train.txt'),sega=sega,sent_eos=sent_eos)
-        # self.vocab.build_vocab()
-        # self.train_cl = self.vocab.encode_file(
-        # os.path.join(path, 'cl-train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
-        # self.train = self.vocab.encode_file(
-        #     os.path.join(path, 'train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
-        # self.valid = self.vocab.encode_file(
-        #     os.path.join(path, 'valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
-        # self.valid_cl = self.vocab.encode_file(
-        # os.path.join(path, 'cl-valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
-        # self.test = self.vocab.encode_file(
-        #     os.path.join(path, 'test.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
-        # self.test_cl = self.vocab.encode_file(
-        # os.path.join(path, 'cl-test.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
 
     def get_iterator(self, split, *args, **kwargs):
         if split == 'train':
@@ -403,3 +397,12 @@ class MixCorpus(object):
         #     data = self.valid if split == 'valid' else self.test
         #     data_iter = LMOrderedIterator(data, *args, **kwargs)
         return data_iter
+    
+    def rebuild_data_with_wn_layer_n(self, wn_layer):
+        self.vocab.word2class = self.vocab.word2class_dict[wn_layer]
+        self.train, self.train_cl = self.vocab.encode_file_plus(
+            os.path.join(self.path, 'train.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        self.valid, self.valid_cl = self.vocab.encode_file_plus(
+            os.path.join(self.path, 'valid.txt'), ordered=True, add_sent_eos=self.add_sent_eos)
+        self.test, self.test_cl = self.vocab.encode_file_plus(
+            os.path.join(self.path, 'test.txt'), ordered=True, add_sent_eos=self.add_sent_eos)

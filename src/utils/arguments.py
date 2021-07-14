@@ -3,8 +3,42 @@ import os
 from tensorboard.compat import tf
 import time
 
+ModelSizeArgs = {
+    "small":{
+        "n_layer": 12,
+        "d_model": 300,
+        "n_head": 10,
+        "d_head": 30,
+        "d_inner": 1500,
+        "tgt_len": 150,
+        "eval_tgt_len": 150,
+    },
+    "base":{
+        "n_layer":16,
+        "d_model":410,
+        "n_head":10,
+        "d_head":41,
+        "d_inner":2100,
+        "tgt_len": 150,
+        "eval_tgt_len": 150,
+    },
+    "large":{
+        "max_step":400000,
+        "batch_size":16,
+        "n_layer":18,
+        "d_model":1024,
+        "n_head":16,
+        "d_head":64,
+        "d_inner":4096,
+        "tgt_len":384,
+        "eval_tgt_len":384,
+    }
+}
+
 def add_model_config_args(parser):
     group = parser.add_argument_group('model', 'model configurations')
+    group.add_argument('--model_size', type=str, default='base',
+                        help='small, base, and large')
     group.add_argument('--n_layer', type=int, default=12,
                         help='number of total layers')
     group.add_argument('--n_head', type=int, default=10,
@@ -206,8 +240,26 @@ def add_classLM_config_args(parser):
                        help='use which layer for auxiliary task')
     group.add_argument('--wn_layer', type=int, default=5,
                        help='use which wordnet layer for class dictionary building')
+    group.add_argument('--ignore_freqency_threshold', type=int, default=6000,
+                       help='use which wordnet layer for class dictionary building')
+    group.add_argument('--dynamic_wn_layer_start_from', type=int, default=-1,
+                       help='change wn_layer gradually during hypernym prediction training')
     group.add_argument('--adaptive_class_softmax', action='store_true',
-                       help='if true, predict class first and then predict the token')
+                       help='if true, predict class first and then predict the token')       
+    group.add_argument('--learn_offset', action='store_true',
+                       help='if true, add hypernym embedding to the offset embedding')
+    group.add_argument('--cl_batch_size', type=int, default=-1,
+                       help='if >0, use this value as the batch size of hypernym prediction')
+    group.add_argument('--min_tokens_per_hypernym', type=int, default=0, help='minimal tokens per hypernym should hold')
+    group.add_argument('--a', type=float,
+                       default=0, help='portion of training steps for hypernym prediction')
+    group.add_argument('--b', type=float,
+                       default=0, help='probability of hypernym prediction at step 0')
+
+    group.add_argument('--pacing_function', type=str,
+                       default='none', help='none, step, linear')
+    group.add_argument('--pacing_unit', type=str,
+                       default='none', help='none, epoch, step')
     return parser
 
 def get_args():
@@ -226,6 +278,9 @@ def get_args():
     parser = add_classLM_config_args(parser)
 
     args = parser.parse_args()
+    model_size_config = ModelSizeArgs[args.model_size]
+    for k,v in model_size_config.items():
+        setattr(args, k, v)
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
     args.tied = not args.not_tied

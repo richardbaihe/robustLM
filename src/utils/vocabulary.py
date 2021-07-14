@@ -7,7 +7,7 @@ from nltk.corpus import wordnet as wn
 
 
 class Vocab(object):
-    def __init__(self, special=[], min_freq=0, max_size=None, lower_case=True,
+    def __init__(self, special=[], min_freq=1, max_size=None, lower_case=True,
                  delimiter=None, vocab_file=None):
         self.counter = Counter()
         self.special = special
@@ -20,6 +20,7 @@ class Vocab(object):
         self.cl_leaf_tokens = []
         self.word2class = {}
         self.class2words = defaultdict(list)
+        self.word2class_dict = defaultdict(dict)
 
     def tokenize(self, line, add_eos=False, add_double_eos=False, add_sent_eos=False, char_level=False):
         line = line.strip()
@@ -147,7 +148,11 @@ class Vocab(object):
             self.cl_leaf_tokens = [self.get_idx(
                 sym) for sym in self.cl_leaf_tokens]
 
-    def get_wn_replaced_dict(self, synset_layer=4, ignore_freqency_threshold=6000):
+    def get_wn_replaced_dict(self, synset_layer=5, ignore_freqency_threshold=6000, replaced_with_new_symbol=True,
+                             min_tokens_per_hypernym=0):
+        
+        word2class = {}
+        class2words = defaultdict(list)
         for k, cnt in self.counter.most_common(self.max_size):
             if cnt >= ignore_freqency_threshold:
                 continue
@@ -160,12 +165,55 @@ class Vocab(object):
                     if len(path) < synset_layer+1:
                         continue
                     else:
-                        if '.n.' not in path[synset_layer].name():
+                        hypernym_name = path[synset_layer].name()
+                        if '.n.' not in hypernym_name:
                             continue
-                        self.class2words[path[synset_layer].name()].append(
+                        if not replaced_with_new_symbol:
+                            hypernym_name = hypernym_name.split('.')[0].split('')
+                        class2words[path[synset_layer].name()].append(
                             k)
-                        self.word2class[k] = path[synset_layer].name()
+                        word2class[k] = path[synset_layer].name()
+                        # self.counter.update([path[synset_layer].name()]*cnt)
                         self.counter.update([path[synset_layer].name()])
+                        continue_for_k = False
+                        break
+                if not continue_for_k:
+                    break
+        for k, v in class2words.items():
+            if len(v) >= min_tokens_per_hypernym:
+                self.class2words[k].extend(v)
+                for token in v:
+                    self.word2class[token] = k
+            else:
+                self.counter[k]=0
+        for k, v in self.class2words.items():
+            self.cl_root_tokens.append(k)
+            self.cl_leaf_tokens.extend(v)
+        # self.vocab.cl_root_tokens = list(self.vocab.class2words.keys())
+        # self.vocab.cl_leaf_tokens = list(self.vocab.word2class.keys())
+
+    def get_wn_replaced_dict_list(self, min_synset_layer=4, max_synset_layer=5, ignore_freqency_threshold=6000, replaced_with_new_symbol=True):
+        for k, cnt in self.counter.most_common(self.max_size):
+            if cnt >= ignore_freqency_threshold:
+                continue
+            if cnt < self.min_freq:
+                break
+            continue_for_k = True
+            for synset in wn.synsets(k):
+                paths = synset.hypernym_paths()
+                for path in paths:
+                    if len(path) < max_synset_layer+1:
+                        continue
+                    else:
+                        hypernym_name = path[max_synset_layer].name()
+                        if '.n.' not in hypernym_name:
+                            continue
+                        for synset_layer in range(min_synset_layer, max_synset_layer+1):
+                            hypernym_name = path[synset_layer].name()
+                            self.class2words[hypernym_name].append(
+                                k)
+                            self.word2class_dict[synset_layer][k] = hypernym_name
+                            self.counter.update([hypernym_name])
                         continue_for_k = False
                         break
                 if not continue_for_k:
@@ -173,8 +221,10 @@ class Vocab(object):
         for k, v in self.class2words.items():
             self.cl_root_tokens.append(k)
             self.cl_leaf_tokens.extend(v)
+        self.cl_leaf_tokens = list(set(self.cl_leaf_tokens))
         # self.vocab.cl_root_tokens = list(self.vocab.class2words.keys())
         # self.vocab.cl_leaf_tokens = list(self.vocab.word2class.keys())
+
 
     def encode_file(self, path, ordered=False, verbose=False, add_eos=True,
                     add_double_eos=False, add_sent_eos=False):

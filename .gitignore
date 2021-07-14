@@ -30,4 +30,7 @@ MANIFEST
 *.manifest
 *.spec
 .vscode
-
+src/wandb/
+pt/
+data/
+output/

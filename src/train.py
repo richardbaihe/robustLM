@@ -85,7 +85,11 @@ def get_lm_corpus(args):
     args.n_token = ntokens.item()
     args.cl_all_root_index = corpus.vocab.cl_root_tokens
     args.cl_all_leaf_index = corpus.vocab.cl_leaf_tokens
+    word2class_id = {}
+    for k,v in corpus.vocab.word2class.items():
+        word2class_id[corpus.vocab.sym2idx[k]] = corpus.vocab.sym2idx[v]
     args.cl_root_leaf_dict = corpus.vocab.class2words
+    args.word2class_id = word2class_id if args.learn_offset else None
     return corpus
 
 def get_model(args):
@@ -183,8 +187,7 @@ def get_model(args):
                 ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
                 same_length=args.same_length, attn_type=args.attn_type,
                 clamp_len=args.clamp_len, sample_softmax=args.sample_softmax, 
-                cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index,
-                                     adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict)
+                                     cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index, adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict, word2class_id=args.word2class_id)
         model.apply(weights_init)
         model.word_emb.apply(weights_init) # ensure embedding init is not overridden by out_layer in case of weight sharing
 
@@ -257,38 +260,61 @@ def get_reduced_loss(loss, world_size):
     loss_reduced = reduced_losses[0]
     return loss_reduced
 
-def forward_step(data_iterator, model, mems, iteration, args):
+def pacing_function(current_step, nbatch_per_epoch, training, args):
+
+    # return true for hypernym prediction, false for token prediction
+    # args.a: fraction of training steps/epochs for hypernym prediction
+    # args.b: probability of hypernym prediction at step 0
+    # function: step: y = b - b*min(1, x//a*total_steps)
+    #           linear: y = b - b/(a*total_steps)*x
+    #           exponential 
+    #           logarithmic 
     class_prediction = False
-    eval_cl_loss = (args.cl_steps!= 0 or args.cl_annealing>0) and not model.training
-    if model.training:
-        if args.cl_steps!= 0:
-            if iteration<args.cl_steps:
-                class_prediction = True
-        elif args.cl_annealing>0:
-            cl_portion = max(0, args.cl_annealing - iteration/args.max_step)
-            random_number = np.random.randint(1,101)
-            class_prediction =  random_number<=(cl_portion*100)
-    if args.multi_obj and args.cl_steps== 0 and args.cl_annealing==0:
+    total_step = args.max_step
+    if args.pacing_unit=='epoch':
+        current_step = current_step//nbatch_per_epoch
+        total_step = args.max_step//nbatch_per_epoch
+    
+    if training:
+        if args.pacing_function=='step':
+            y = args.b - args.b * min(1, current_step//int(args.a*total_step))
+        elif args.pacing_function == 'linear':
+            y = max(0, args.b - args.b/int(args.a*total_step)*current_step)
+        else:
+            y = 0
+        random_number = np.random.randint(1, 101)
+        class_prediction = random_number <= (y*100)
+    if args.multi_obj and args.pacing_unit != 'none':
         class_prediction = True
-    if args.multi_obj and not model.training:
+    if args.multi_obj and not training:
         class_prediction = True
+    return class_prediction
+    
+def forward_step(data_iterator, model, mems, iteration, args):
+    eval_cl_loss = (args.pacing_unit!='none') and not model.training
+    class_prediction = pacing_function(iteration, data_iterator.n_batch, model.training, args)
     data, target, cl_data, cl_target = get_batch(data_iterator,iteration)
     root_mask = cl_target!=target
     input_root = args.input_root and class_prediction
+
+    hypernym_input = cl_data*(cl_data != data)
     if class_prediction:
         if input_root:
-            ret = model(cl_data, target, cl_target, mems, args, class_prediction=True)
+            ret = model(cl_data, target, cl_target, mems, args, class_prediction=True,hypernym_input=hypernym_input)
         else:
-            ret = model(data, target, cl_target, mems, args, class_prediction=True)
+            ret = model(data, target, cl_target, mems, args,
+                        class_prediction=True, hypernym_input=hypernym_input)
     else:
-        ret = model(data, target, cl_target, mems, args)
+        ret = model(data, target, cl_target, mems,
+                    args, hypernym_input=hypernym_input)
     # ret = model(data, target, cl_data, cl_target, mems, class_prediction, input_root)
     lm_loss, auxiliary_loss, new_mems = ret[0], ret[1], ret[2:]
     if eval_cl_loss:
         if args.input_root:
-            ret = model(cl_data, target, cl_target, mems, args, class_prediction=True)
+            ret = model(cl_data, target, cl_target, mems, args, class_prediction=True,hypernym_input=hypernym_input)
         else:
-            ret = model(data, target, cl_target, mems, args, class_prediction=True)
+            ret = model(data, target, cl_target, mems, args,
+                        class_prediction=True, hypernym_input=hypernym_input)
         auxiliary_loss = ret[1]
     cl_loss = lm_loss[root_mask]
     non_cl_loss = lm_loss[~root_mask]
@@ -338,7 +364,7 @@ def train_step(data_iterator, mems, model, optimizer, lr_scheduler, iteration, a
 
     return lm_loss_reduced, auxiliary_loss_reduced, cl_lm_loss_reduced, non_cl_lm_loss_reduced, new_mems
 
-def train(model, optimizer, lr_scheduler, train_data_iterator, val_data_iterator, args):
+def train(model, optimizer, lr_scheduler, corpus, train_data_iterator, val_data_iterator, args):
     # Turn on training mode which enables dropout.
     # global train_step, train_loss, best_val_loss, eval_start_time, log_start_time
     model.train()
@@ -350,7 +376,46 @@ def train(model, optimizer, lr_scheduler, train_data_iterator, val_data_iterator
     mems = tuple()
     iteration = args.iteration
     log_start_time = time.time()
+    hypernym_grad = True
+    cl_batch_size = False
+    if args.pacing_unit == 'step':
+        cl_steps = int(args.max_step*args.a)
+    elif args.pacing_unit == 'epoch':
+        cl_steps = int(
+            args.max_step//train_data_iterator.n_batch*args.a)*train_data_iterator.n_batch
+    else:
+        cl_steps = 0
     while iteration < args.max_step:
+        if args.dynamic_wn_layer_start_from >0:
+            if iteration>=cl_steps:
+                continue
+            wn_layer_list = sorted(list(corpus.vocab.word2class_dict.keys()))
+            update_interval = int(cl_steps//len(wn_layer_list))
+            if iteration % update_interval == 0:
+                wn_layer_index = round(iteration/update_interval)
+                wn_layer = wn_layer_list[
+                    wn_layer_index]
+                corpus.rebuild_data_with_wn_layer_n(wn_layer)
+                device = torch.device('cuda' if args.cuda else 'cpu')
+                tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len,
+                                            device=device, ext_len=args.ext_len, rank=args.rank, world_size=args.world_size)
+                va_iter = corpus.get_iterator('valid', args.eval_batch_size, args.eval_tgt_len,
+                                            device=device, ext_len=args.ext_len, rank=0, world_size=1)
+
+        if args.cl_batch_size>0:
+            if iteration < cl_steps*2 and not cl_batch_size:
+                device = torch.device('cuda' if args.cuda else 'cpu')
+                train_data_iterator = corpus.get_iterator('train', args.cl_batch_size, args.tgt_len,
+                                            device=device, ext_len=args.ext_len, rank=args.rank, world_size=args.world_size)
+                cl_batch_size = True
+            elif iteration>=cl_steps*2 and cl_batch_size:
+                cl_batch_size=False
+                device = torch.device('cuda' if args.cuda else 'cpu')
+                train_data_iterator = corpus.get_iterator('train', args.batch_size, args.tgt_len,
+                            device=device, ext_len=args.ext_len, rank=args.rank, world_size=args.world_size)
+        # if hypernym_grad and args.learn_offset and iteration>args.cl_steps:
+        #     model.module.change()
+        #     hypernym_grad = False
         lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = train_step(train_data_iterator, mems, model, optimizer, lr_scheduler, iteration, args)
         iteration += 1
         current_lm_loss = lm_loss.data.detach().float().item()
@@ -490,18 +555,17 @@ def main():
 
     model, optimizer, scheduler = setup_model_and_optimizer(args)
 
-    eval_batch_size = 10
+    args.eval_batch_size = 10
     tr_iter, va_iter, te_iter = None, None, None
-    if corpus:
-        tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len,
-            device=device, ext_len=args.ext_len,rank=args.rank, world_size=args.world_size)
-        va_iter = corpus.get_iterator('valid', eval_batch_size, args.eval_tgt_len,
-            device=device, ext_len=args.ext_len,rank=0, world_size=1)
-        te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len,
-            device=device, ext_len=args.ext_len,rank=0, world_size=1)
+    tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len,
+        device=device, ext_len=args.ext_len,rank=args.rank, world_size=args.world_size)
+    va_iter = corpus.get_iterator('valid', args.eval_batch_size, args.eval_tgt_len,
+        device=device, ext_len=args.ext_len,rank=0, world_size=1)
+    te_iter = corpus.get_iterator('test', args.eval_batch_size, args.eval_tgt_len,
+        device=device, ext_len=args.ext_len,rank=0, world_size=1)
 
     if args.do_train:
-        train(model, optimizer, scheduler, tr_iter, va_iter, args)
+        train(model, optimizer, scheduler, corpus, tr_iter, va_iter, args)
     if args.do_eval and args.checkpoint_dir:
         for checkpoint_name in glob.glob(os.path.join(args.checkpoint_dir,'iter_*/model_optim_rng.pt')):
             iteration = load_checkpoint(model, optimizer, scheduler, args, checkpoint_name=checkpoint_name)

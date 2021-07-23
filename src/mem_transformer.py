@@ -727,6 +727,8 @@ class MemTransformerLM(nn.Module):
                  sample_softmax=-1, cl_all_root_index=None, cl_all_leaf_index=None,
                  adaptive_class_softmax=False, cl_root_leaf_dict=None, word2class_id=None):
         super(MemTransformerLM, self).__init__()
+        # if word2class_id:
+        #     n_token = n_token-len(cl_root_leaf_dict)
         self.n_token = n_token
 
         d_embed = d_model if d_embed is None else d_embed
@@ -736,9 +738,15 @@ class MemTransformerLM(nn.Module):
         self.d_head = d_head
 
         self.word2class = word2class_id
-
+        # if word2class_id:
+        #     self.word_emb = AdaptiveEmbedding(n_token-len(cl_root_leaf_dict), d_embed, d_model, cutoffs,
+        #                         div_val=div_val)
+        #     self.hypernym_emb = nn.Embedding(
+        #         len(cl_all_root_index)+1, d_embed, padding_idx=0)
+        # else:
         self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs,
-                                          div_val=div_val)
+                                        div_val=div_val)
+            
         self.auxiliary_projection_layer = nn.Linear(d_model, d_model)
         self.auxiliary_output_layer = nn.Linear(
             d_model, len(cl_all_root_index))
@@ -807,12 +815,8 @@ class MemTransformerLM(nn.Module):
             if tie_weight:
                 for i in range(len(self.crit.out_layers)):
                     self.crit.out_layers[i].weight = self.word_emb.emb_layers[i].weight
-                # if self.cl_root_vocab:
-                #     with torch.no_grad():
-                #             # i, new_k = get_ith_embed_layer_given_index(k, self.word_emb)
-                #             # assert i>=0, "Error when building root embedding"
-                #         indices = torch.tensor(cl_all_root_index)
-                #         self.auxiliary_output_layer.weight = self.word_emb.emb_layers[0].weight.index_select(0, indices)
+                # if self.word2class:
+                #     self.crit.hypernym_emb.weight = self.hypernym_emb.weight
 
             if tie_projs:
                 for i, tie_proj in enumerate(tie_projs):
@@ -991,10 +995,12 @@ class MemTransformerLM(nn.Module):
 
         return core_out, hids, new_mems
 
-    def _forward_offset(self, dec_inp, hypernym_inp, mems=None, pst=None):
+    def _forward_offset(self, dec_inp, hypernym_inp, mems=None, pst=None, mask=False):
         qlen, bsz = dec_inp.size()
 
         word_emb = self.word_emb(dec_inp)
+        # if mask:
+        #     word_emb[(hypernym_inp!=0)] = 0
         hypernym_emb = self.word_emb(hypernym_inp)
         hypernym_emb[(hypernym_inp==0)] = 0
         word_emb = word_emb+hypernym_emb
@@ -1123,8 +1129,12 @@ class MemTransformerLM(nn.Module):
             mems = self.init_mems()
 
         tgt_len = target.size(0)
-        if args.learn_offset:
-            hidden, hiddens, new_mems = self._forward_offset(data,hypernym_input, mems=mems)
+        if hypernym_input is not None:
+            # mask=False
+            # if data.max()>=self.word_emb.n_token:
+            #     mask=True
+            #     data = torch.clamp(data,max=self.word_emb.n_token-1)
+            hidden, hiddens, new_mems = self._forward_offset(data, hypernym_input, mems=mems)
         else:
             hidden, hiddens, new_mems = self._forward(data, mems=mems)
 

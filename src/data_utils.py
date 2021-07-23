@@ -374,6 +374,8 @@ class MixCorpus(object):
                 min_tokens_per_hypernym=args.min_tokens_per_hypernym)
         if args.adaptive_class_softmax:
             self.vocab.build_vocab_with_cl_order()
+        # elif args.learn_offset or args.vocab_order_hypernym_last:
+        #     self.vocab.build_vocab_hypernym_last()
         else:
             self.vocab.build_vocab()
         self.train, self.train_cl = self.vocab.encode_file_plus(

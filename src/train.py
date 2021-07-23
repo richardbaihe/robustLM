@@ -190,7 +190,9 @@ def get_model(args):
                                      cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index, adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict, word2class_id=args.word2class_id)
         model.apply(weights_init)
         model.word_emb.apply(weights_init) # ensure embedding init is not overridden by out_layer in case of weight sharing
-
+        # if args.learn_offset:
+        #     model.hypernym_emb.apply(weights_init)
+        #     model.hypernym_emb.weight.data[0,:] = 0
     args.n_all_param = sum([p.nelement() for p in model.parameters()])
     args.n_nonemb_param = sum([p.nelement() for p in model.layers.parameters()])
     model = model.to(device)
@@ -300,7 +302,7 @@ def forward_step(data_iterator, model, mems, iteration, args):
     hypernym_input = cl_data*(cl_data != data)
     if class_prediction:
         if input_root:
-            ret = model(cl_data, target, cl_target, mems, args, class_prediction=True,hypernym_input=hypernym_input)
+            ret = model(cl_data, target, cl_target, mems, args, class_prediction=True)
         else:
             ret = model(data, target, cl_target, mems, args,
                         class_prediction=True, hypernym_input=hypernym_input)
@@ -311,7 +313,7 @@ def forward_step(data_iterator, model, mems, iteration, args):
     lm_loss, auxiliary_loss, new_mems = ret[0], ret[1], ret[2:]
     if eval_cl_loss:
         if args.input_root:
-            ret = model(cl_data, target, cl_target, mems, args, class_prediction=True,hypernym_input=hypernym_input)
+            ret = model(cl_data, target, cl_target, mems, args, class_prediction=True)
         else:
             ret = model(data, target, cl_target, mems, args,
                         class_prediction=True, hypernym_input=hypernym_input)
@@ -488,7 +490,7 @@ def evaluate(data_iterator, model, args):
             if args.max_eval_steps > 0 and iteration >= args.max_eval_steps:
                 total_len = args.max_eval_steps*args.eval_tgt_len
                 break
-            lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
+            lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = forward_step(data_iterator, model, mems, iteration, args)
 
             seq_len = lm_loss.size()[0]
             total_lm_len += seq_len

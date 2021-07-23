@@ -118,6 +118,37 @@ class Vocab(object):
             self.cl_leaf_tokens = [self.get_idx(
                 sym) for sym in self.cl_leaf_tokens]
 
+    def build_vocab_hypernym_last(self):
+        if self.vocab_file:
+            print('building vocab from {}'.format(self.vocab_file))
+            self._build_from_file(self.vocab_file)
+            print('final vocab size {}'.format(len(self)))
+        else:
+            print('building vocab with min_freq={}, max_size={}'.format(
+                self.min_freq, self.max_size))
+            self.idx2sym = []
+            self.sym2idx = OrderedDict()
+
+            for sym in self.special:
+                self.add_special(sym)
+            hypernym_tokens = self.cl_root_tokens
+            for sym, cnt in self.counter.most_common(self.max_size):
+                if cnt < self.min_freq:
+                    break
+                if sym in hypernym_tokens:
+                    continue
+                self.add_symbol(sym)
+            for h_token in hypernym_tokens:
+                self.add_symbol(h_token)
+            print('final vocab size {} from {} unique tokens'.format(
+                len(self), len(self.counter)))
+        if self.cl_root_tokens:
+            self.cl_root_tokens = [self.get_idx(
+                sym) for sym in self.cl_root_tokens]
+            self.cl_leaf_tokens = [self.get_idx(
+                sym) for sym in self.cl_leaf_tokens]
+
+
     def build_vocab_with_cl_order(self):
         self.idx2sym = []
         self.sym2idx = OrderedDict()
@@ -189,6 +220,7 @@ class Vocab(object):
         for k, v in self.class2words.items():
             self.cl_root_tokens.append(k)
             self.cl_leaf_tokens.extend(v)
+        self.cl_leaf_tokens = list(set(self.cl_leaf_tokens))
         # self.vocab.cl_root_tokens = list(self.vocab.class2words.keys())
         # self.vocab.cl_leaf_tokens = list(self.vocab.word2class.keys())
 

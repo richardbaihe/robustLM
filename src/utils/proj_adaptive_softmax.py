@@ -296,7 +296,8 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
         self.cutoffs = cutoffs + [n_token]
         self.cutoff_ends = [0] + self.cutoffs
         self.div_val = div_val
-        self.learn_offset=True if word2class else False
+        self.learn_offset = True if word2class else False
+        self.word2class = word2class
 
         self.cl_all_root_index = cl_all_root_index
         self.cl_all_leaf_index = cl_all_leaf_index
@@ -327,18 +328,26 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                     )
                 else:
                     self.out_projs.append(None)
-
+            # if self.learn_offset:
+            #     n_token = n_token-len(cl_all_root_index)
+            #     self.n_token = n_token
+            #     self.out_layers.append(nn.Linear(d_embed, n_token))
+            #     self.hypernym_emb = nn.Linear(
+            #         d_embed, len(cl_all_root_index)+1)
+            #     hypernym_list = []
+            #     for i in range(n_token):
+            #         if i in word2class.keys():
+            #             hypernym_list.append(word2class[i]+1-n_token)
+            #         else:
+            #             hypernym_list.append(0)
+            #     # for i in range(n_token):
+            #     #     if i in word2class:
+            #     #         hypernym_list.append(word2class[i])
+            #     #     else:
+            #     #         hypernym_list.append(0)
+            #     self.hypernym_list = hypernym_list
+            # else:
             self.out_layers.append(nn.Linear(d_embed, n_token))
-            
-            if word2class:
-                hypernym_list = []
-                for i in range(n_token):
-                    if i in word2class:
-                        hypernym_list.append(word2class[i])
-                    else:
-                        hypernym_list.append(0)
-                self.hypernym_list = hypernym_list
-
         else:
             for i in range(len(self.cutoffs)):
                 l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i+1]
@@ -377,30 +386,22 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
         if hidden.size(0) != target.size(0):
             raise RuntimeError('Input and target should have the same size '
                                'in the batch dimension.')
-        if self.learn_offset:
-            if type(self.hypernym_list) is not torch.Tensor:
-                self.hypernym_list = torch.tensor(
-                    self.hypernym_list, device=hidden.device)
-                self.hypernym_mask = self.hypernym_list == 0
-            # hypernym_list = torch.tensor(self.hypernym_list, device=hidden.device)
-            hypernym_list_weight = self.out_layers[0].weight[self.hypernym_list] 
-            #* (hypernym_list != 0).unsqueeze(-1)
-            hypernym_list_weight[self.hypernym_mask] = 0
-            hypernym_list_bias = self.out_layers[0].bias[self.hypernym_list]
-            # * (hypernym_list != 0)
-            hypernym_list_bias[self.hypernym_mask] = 0
-
-            self.out_layer_for_offset_weight = self.out_layers[0].weight + \
-                hypernym_list_weight
-            self.out_layer_for_offset_bias = self.out_layers[0].bias + \
-                hypernym_list_bias
+        # if self.learn_offset:
+        #     if type(self.hypernym_list) is not torch.Tensor:
+        #         self.hypernym_list = torch.tensor(
+        #             self.hypernym_list, device=hidden.device)
+        #     hypernym_list_weight = self.hypernym_emb.weight[self.hypernym_list]
+        #     self.out_layer_for_offset_weight = torch.cat(
+        #         [self.out_layers[0].weight+hypernym_list_weight, self.hypernym_emb.weight[1:]])
+        #     self.out_layer_for_offset_bias = torch.cat(
+        #         [self.out_layers[0].bias, self.hypernym_emb.bias[1:]])
         if self.n_clusters == 0:
-            if self.learn_offset:
-                logit = self._compute_logit(hidden, self.out_layer_for_offset_weight.weight,
-                                            self.out_layer_for_offset_bias, self.out_projs[0])
-            else:
-                logit = self._compute_logit(hidden, self.out_layers[0].weight,
-                                            self.out_layers[0].bias, self.out_projs[0])
+            # if self.learn_offset:
+            #     logit = self._compute_logit(hidden, self.out_layer_for_offset_weight.weight,
+            #                                 self.out_layer_for_offset_bias, self.out_projs[0])
+            # else:
+            logit = self._compute_logit(hidden, self.out_layers[0].weight,
+                                        self.out_layers[0].bias, self.out_projs[0])
             if predict_root:
                 logit[:,self.cl_all_leaf_index] = -float('inf')
             else:
@@ -416,12 +417,12 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
             for i in range(len(self.cutoffs)):
                 if self.div_val == 1:
                     l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
-                    if self.learn_offset:
-                        weight_i = self.out_layer_for_offset_weight[l_idx:r_idx]
-                        bias_i = self.out_layer_for_offset_bias[l_idx:r_idx]
-                    else:
-                        weight_i = self.out_layers[0].weight[l_idx:r_idx]
-                        bias_i = self.out_layers[0].bias[l_idx:r_idx]
+                    # if self.learn_offset:
+                    #     weight_i = self.out_layer_for_offset_weight[l_idx:r_idx]
+                    #     bias_i = self.out_layer_for_offset_bias[l_idx:r_idx]
+                    # else:
+                    weight_i = self.out_layers[0].weight[l_idx:r_idx]
+                    bias_i = self.out_layers[0].bias[l_idx:r_idx]
                 else:
                     weight_i = self.out_layers[i].weight
                     bias_i = self.out_layers[i].bias

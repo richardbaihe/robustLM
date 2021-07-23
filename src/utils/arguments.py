@@ -260,6 +260,8 @@ def add_classLM_config_args(parser):
                        default='none', help='none, step, linear')
     group.add_argument('--pacing_unit', type=str,
                        default='none', help='none, epoch, step')
+    group.add_argument('--vocab_order_hypernym_last', action='store_true',
+                       help='put words with hypernym and hypernyms to the last of vocab')
     return parser
 
 def get_args():

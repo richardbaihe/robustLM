@@ -23,8 +23,6 @@ ModelSizeArgs = {
         "eval_tgt_len": 150,
     },
     "large":{
-        "max_step":400000,
-        "batch_size":16,
         "n_layer":18,
         "d_model":1024,
         "n_head":16,
@@ -32,6 +30,10 @@ ModelSizeArgs = {
         "d_inner":4096,
         "tgt_len":384,
         "eval_tgt_len":384,
+        "dropout":0.2,
+        "dropatt":0.2,
+        "warmup_step":16000,
+        "div_val":4
     }
 }
 
@@ -89,7 +91,7 @@ def add_training_config_args(parser):
                         help='report interval')
     group.add_argument('--eval_interval', type=int, default=4000,
                         help='evaluation interval')
-    group.add_argument('--save_interval', type=int, default=5000,
+    group.add_argument('--save_interval', type=int, default=20000,
                         help='evaluation interval')
     group.add_argument('--load_lastest', action='store_true',
                         help='continue training from lastest checkpoint')                

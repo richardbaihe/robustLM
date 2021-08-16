@@ -126,9 +126,9 @@ def load_checkpoint(model, optimizer, lr_scheduler, args, best=False, checkpoint
     model.load_state_dict(sd['model'])
 
     # Optimizer.
-    if optimizer is not None:
+    if optimizer is not None and 'optimizer' in sd.keys():
         optimizer.load_state_dict(sd['optimizer'])
-    if lr_scheduler is not None:
+    if lr_scheduler is not None and 'lr_scheduler' in sd.keys():
         lr_scheduler.load_state_dict(sd['lr_scheduler'])
 
     # rng states.

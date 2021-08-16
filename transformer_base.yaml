@@ -1,7 +1,7 @@
 target:
   service: amlk8s
-  name: itpeastusv100cl
-  vc: resrchvc
+  name: itpmtlv100cl1
+  vc: MSRMTLVC1
   # itpeastusv100cl
   # service: aml
   # name: canada24
@@ -23,24 +23,21 @@ data:
 
 # list of jobs to run, we run 2 jobs in this example
 jobs:
-- name: train_small_32
+- name: train_large_baseline
   sku: G4
   command:
   - python -m torch.distributed.launch 
-    --nproc_per_node 4 
+    --nproc_per_node 8 
     --nnodes 1 
     --node_rank 0 
     --master_addr 127.0.0.1 
     --master_port 16010
     train.py 
-    --model_size small
-    --job_name trans_small_32
-    --batch_size 32
-    --max_step 200000
-    --mix_vocab
-    --cl_annealing 0
+    --job_name train_large_baseline
+    --max_step 500000
+    --batch_size 16
+    --model_size large
     --dataset wt103
-    --mem_len 0
     --adaptive
     --fp16
     --dynamic-loss-scale
@@ -49,53 +46,29 @@ jobs:
     --pt
     --do_train
     --do_test
-- name: train_base_8_0.64
+
+- name: train_large_hp
   sku: G4
   command:
   - python -m torch.distributed.launch 
-    --nproc_per_node 4 
+    --nproc_per_node 8 
     --nnodes 1 
     --node_rank 0 
     --master_addr 127.0.0.1 
     --master_port 16010
     train.py 
-    --job_name train_base_8_0.64
-    --max_step 200000
-    --batch_size 8
-    --model_size base
-    --cl_annealing 0.64
+    --job_name train_large_hp
+    --pacing_function step
+    --pacing_unit step
+    --a 0.12
+    --b 0.8
     --wn_layer 5
     --mix_vocab
     --input_root
+    --max_step 500000
+    --batch_size 16
+    --model_size large
     --dataset wt103
-    --mem_len 0
-    --adaptive
-    --fp16
-    --dynamic-loss-scale
-    --multi_gpu
-    --cuda
-    --pt
-    --do_train
-    --do_test
-- name: trans_small_0.64
-  sku: G4
-  command:
-  - python -m torch.distributed.launch 
-    --nproc_per_node 4 
-    --nnodes 1 
-    --node_rank 0 
-    --master_addr 127.0.0.1 
-    --master_port 16010
-    train.py 
-    --job_name small_0.64
-    --cl_annealing 0.64
-    --max_step 100000
-    --batch_size 64
-    --model_size small
-    --mix_vocab
-    --input_root
-    --dataset wt103
-    --mem_len 0
     --adaptive
     --fp16
     --dynamic-loss-scale

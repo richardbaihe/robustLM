@@ -9,6 +9,9 @@ import itertools
 import logging
 import numpy as np
 import wandb
+from collections import defaultdict
+import scipy.stats as ss
+from tqdm import tqdm
 
 import mpu
 import torch
@@ -66,7 +69,6 @@ def set_random_seed(seed):
         torch.manual_seed(seed)
         # mpu.model_parallel_cuda_manual_seed(seed)
 
-
 def get_lm_corpus(args):
     corpus = None
     kwargs = {}
@@ -76,8 +78,13 @@ def get_lm_corpus(args):
     else:
         raise NotImplementedError
     fn = os.path.join(args.data, 'cache.pt')
-    print('Producing dataset {} with rank {}'.format(args.dataset, args.rank))
-    corpus = MixCorpus(args, **kwargs)
+    if not args.pt and os.path.exists(fn):
+        print('Loading cached dataset...')
+        corpus = torch.load(fn)
+    else:
+        print('Producing dataset {} with rank {}'.format(args.dataset, args.rank))
+        corpus = MixCorpus(args, **kwargs)
+        torch.save(corpus, fn)
     #torch.save(corpus, fn)
     ntokens = torch.cuda.LongTensor([len(corpus.vocab)])
     # cl_root_tokens = torch.cuda.LongTensor(corpus.vocab.cl_root_tokens)
@@ -454,13 +461,13 @@ def train(model, optimizer, lr_scheduler, corpus, train_data_iterator, val_data_
             total_non_cl_lm_loss = 0
             total_auxiliary_loss = 0
         if iteration % args.save_interval == 0 :
-            save_checkpoint(iteration, model, optimizer, lr_scheduler, args, best=False)
+            save_checkpoint(iteration, model, None, None, args, best=False)
         if iteration % args.eval_interval == 0:
             val_lm_ppl = None
             if args.rank == 0:
                 val_lm_ppl = evaluate_and_print_results(val_data_iterator, model,args, iteration)
                 if val_lm_ppl < best_val_ppl:
-                    save_checkpoint(iteration, model, optimizer, lr_scheduler, args, best=True)
+                    save_checkpoint(iteration, model, None, None, args, best=True)
                     best_val_ppl = val_lm_ppl
             torch.distributed.barrier()
 
@@ -483,12 +490,12 @@ def evaluate(data_iterator, model, args):
     total_lm_len, total_lm_loss = 0, 0.
     total_cl_len, total_cl_loss = 0, 0.
     total_non_cl_len, total_non_cl_loss = 0, 0.
-    total_auxiliary_len, total_auxiliary_loss = 0, 0.
+    total_auxiliary_loss = 0, 0.
     with torch.no_grad():
         mems = tuple()
         for iteration in range(data_iterator.n_batch):
             if args.max_eval_steps > 0 and iteration >= args.max_eval_steps:
-                total_len = args.max_eval_steps*args.eval_tgt_len
+                # total_len = args.max_eval_steps*args.eval_tgt_len
                 break
             lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = forward_step(data_iterator, model, mems, iteration, args)
 
@@ -538,6 +545,88 @@ def test(data_iterator, model, args, iteration):
         wandb.log({"test/ppl": val_lm_ppl, "test/cl_ppl": val_cl_ppl, "test/non_cl_ppl": val_non_cl_ppl, "test/auxiliary_loss":auxiliary_loss})
     model.train()
     return val_lm_ppl
+
+def get_topk_pred(model, va_iter,top_k=1000):
+    model.eval()
+    while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
+        model = model.module
+    top_k_pred = defaultdict(list)
+    mems=tuple()
+    for iteration in tqdm(range(va_iter.n_batch)):
+        if not mems:
+            mems = model.init_mems()
+        data, target, cl_data, cl_target = get_batch(va_iter,iteration)
+        tgt_len = target.size(0)
+        root_mask = cl_target!=target
+        hidden, hiddens, new_mems = model._forward(data, mems=mems)
+        pred_hid = hidden[-tgt_len:]
+        pred_hid = torch.reshape(
+                pred_hid, (-1, pred_hid.size(-1)))
+
+        topk_words,topk_probs = model.crit.get_top_k_words_and_props(pred_hid,torch.reshape(target, (-1,)), top_k=top_k)   
+        for k,v in zip(target.view(-1).tolist(), topk_words.tolist()):
+            top_k_pred[k].append(v)
+    return top_k_pred
+
+def get_gt_rank_and_prob(model, va_iter,cl_all_leaf_sym, class2words, word2class):
+
+    model.eval()
+    while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
+        model = model.module
+    results_rank = defaultdict(list)
+    results_prob = defaultdict(list)
+    results_sib_rank = defaultdict(list)
+    results_sib_prob = defaultdict(list)
+    results_sib_rank_among_classes = defaultdict(list)
+    mems=tuple()
+    for iteration in tqdm(range(va_iter.n_batch)):
+        if not mems:
+            mems = model.init_mems()
+        data, target, cl_data, cl_target = get_batch(va_iter,iteration)
+        tgt_len = target.size(0)
+        root_mask = cl_target!=target
+        hidden, hiddens, new_mems = model._forward(data, mems=mems)
+        pred_hid = hidden[-tgt_len:]
+        pred_hid = torch.reshape(
+                pred_hid, (-1, pred_hid.size(-1)))
+        target = torch.reshape(target, (-1,))
+        mask = []
+        for i,k in enumerate(target.view(-1).tolist()):
+            if k not in cl_all_leaf_sym:
+                mask.append(False)
+            else:
+                mask.append(True)
+        mask = torch.tensor(mask)
+        pred_hid = pred_hid[mask]
+        target = target[mask]
+        probs = model.crit.get_top_k_words_and_props(pred_hid, target, top_k=-1)
+        for i,k in enumerate(target.view(-1).tolist()):
+            if k not in cl_all_leaf_sym:
+                continue
+            else:
+                siblings = class2words[word2class[k]]
+                v = probs[i].tolist()
+                sib_prob = -math.log(sum([math.exp(-v[idx]) for idx in siblings]))
+                
+                # ranked_v = ss.rankdata(v)
+                # sib_rank = sum([1/(len(v) - ranked_v[idx]) for idx in siblings])/len(siblings)
+                # normalized_sib_rank = 0
+                # for cl, sibs in class2words.items():
+                #     if cl == word2class[k]:
+                #         continue
+                #     if sib_rank > sum([1/(len(v) - ranked_v[idx]) for idx in sibs])/len(sibs):
+                #         normalized_sib_rank+=1
+                # rank = len(v) - ranked_v[k]
+                sib_rank=0
+                rank=0
+                normalized_sib_rank=0
+
+                results_rank[k].append(rank)
+                results_prob[k].append(v[k])
+                results_sib_prob[k].append(sib_prob)
+                results_sib_rank[k].append(sib_rank)
+                results_sib_rank_among_classes[k].append(normalized_sib_rank)
+    return results_rank, results_prob, results_sib_rank, results_sib_prob,results_sib_rank_among_classes
 
 def main():
     args = get_args()

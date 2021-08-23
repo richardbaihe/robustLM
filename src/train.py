@@ -490,7 +490,7 @@ def evaluate(data_iterator, model, args):
     total_lm_len, total_lm_loss = 0, 0.
     total_cl_len, total_cl_loss = 0, 0.
     total_non_cl_len, total_non_cl_loss = 0, 0.
-    total_auxiliary_loss = 0, 0.
+    total_auxiliary_loss = 0
     with torch.no_grad():
         mems = tuple()
         for iteration in range(data_iterator.n_batch):
@@ -573,11 +573,13 @@ def get_gt_rank_and_prob(model, va_iter,cl_all_leaf_sym, class2words, word2class
     model.eval()
     while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
         model = model.module
-    results_rank = defaultdict(list)
+    #results_rank = defaultdict(list)
     results_prob = defaultdict(list)
-    results_sib_rank = defaultdict(list)
+    #results_sib_rank = defaultdict(list)
     results_sib_prob = defaultdict(list)
-    results_sib_rank_among_classes = defaultdict(list)
+    results_class_prob = defaultdict(list)
+    results_normalized_prob = defaultdict(list)
+    #results_sib_rank_among_classes = defaultdict(list)
     mems=tuple()
     for iteration in tqdm(range(va_iter.n_batch)):
         if not mems:
@@ -606,7 +608,13 @@ def get_gt_rank_and_prob(model, va_iter,cl_all_leaf_sym, class2words, word2class
             else:
                 siblings = class2words[word2class[k]]
                 v = probs[i].tolist()
-                sib_prob = -math.log(sum([math.exp(-v[idx]) for idx in siblings]))
+                class_prob = math.log(sum([math.exp(v[idx]) for idx in siblings]))
+                sib_prob = sum([math.exp(v[idx]) if idx!=k else 0 for idx in siblings])
+                if sib_prob!=0:
+                    results_normalized_prob[k].append(math.log(math.exp(v[k])/math.exp(class_prob)))
+                    sib_prob = math.log(sib_prob)
+                    results_sib_prob[k].append(sib_prob)
+                    
                 
                 # ranked_v = ss.rankdata(v)
                 # sib_rank = sum([1/(len(v) - ranked_v[idx]) for idx in siblings])/len(siblings)
@@ -617,16 +625,16 @@ def get_gt_rank_and_prob(model, va_iter,cl_all_leaf_sym, class2words, word2class
                 #     if sib_rank > sum([1/(len(v) - ranked_v[idx]) for idx in sibs])/len(sibs):
                 #         normalized_sib_rank+=1
                 # rank = len(v) - ranked_v[k]
-                sib_rank=0
-                rank=0
-                normalized_sib_rank=0
+                # sib_rank=0
+                # rank=0
+                # normalized_sib_rank=0
 
-                results_rank[k].append(rank)
+                #results_rank[k].append(rank)
                 results_prob[k].append(v[k])
-                results_sib_prob[k].append(sib_prob)
-                results_sib_rank[k].append(sib_rank)
-                results_sib_rank_among_classes[k].append(normalized_sib_rank)
-    return results_rank, results_prob, results_sib_rank, results_sib_prob,results_sib_rank_among_classes
+                results_class_prob[k].append(class_prob)
+                #results_sib_rank[k].append(sib_rank)
+                #results_sib_rank_among_classes[k].append(normalized_sib_rank)
+    return results_prob, results_sib_prob,results_class_prob,results_normalized_prob
 
 def main():
     args = get_args()

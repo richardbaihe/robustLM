@@ -10,7 +10,7 @@ import logging
 import numpy as np
 import wandb
 from collections import defaultdict
-import scipy.stats as ss
+# import scipy.stats as ss
 from tqdm import tqdm
 
 import mpu

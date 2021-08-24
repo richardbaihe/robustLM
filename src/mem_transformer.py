@@ -38,6 +38,8 @@ class PositionalEmbedding(nn.Module):
         if torch.is_autocast_enabled():
             self.inv_freq = self.inv_freq.half()
             pos_seq=pos_seq.half()
+        else:
+            self.inv_freq = self.inv_freq.float()
         if sega:
             sinusoid_inp = torch.bmm(pos_seq.unsqueeze(-1),
                                      self.inv_freq.unsqueeze(0).unsqueeze(0).expand(pos_seq.size(0), -1, -1))

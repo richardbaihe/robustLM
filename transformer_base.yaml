@@ -37,6 +37,7 @@ jobs:
     --max_step 500000
     --batch_size 16
     --model_size large
+    --mix_vocab
     --dataset wt103
     --adaptive
     --fp16

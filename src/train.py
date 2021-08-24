@@ -19,10 +19,10 @@ import torch.nn as nn
 import torch.optim as optim
 from fp16 import FP16_Module
 from fp16 import FP16_Optimizer
+from torch.cuda.amp import autocast
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from apex.parallel import DistributedDataParallel as apexDDP
 from apex.optimizers import FusedAdam as Adam
-from apex import amp, optimizers
 from apex import amp, optimizers
 from utils.arguments import get_args
 from data_utils import MixCorpus
@@ -194,7 +194,7 @@ def get_model(args):
                 ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
                 same_length=args.same_length, attn_type=args.attn_type,
                 clamp_len=args.clamp_len, sample_softmax=args.sample_softmax, 
-                                     cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index, adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict, word2class_id=args.word2class_id)
+                                     cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index, adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict, word2class_id=args.word2class_id,mix_vocab=args.mix_vocab)
         model.apply(weights_init)
         model.word_emb.apply(weights_init) # ensure embedding init is not overridden by out_layer in case of weight sharing
         # if args.learn_offset:
@@ -245,14 +245,15 @@ def setup_model_and_optimizer(args):
     if args.load_lastest:
         args.iteration = load_checkpoint(model, optimizer, scheduler, args, best=False)
     
-    if args.fp16:
-        # model = model.half()
-        model, optimizer = amp.initialize(model, optimizer,
-                                      opt_level="O2",
-                                      loss_scale='dynamic'
-                                      )
-    model = apexDDP(model)
-    return model, optimizer, scheduler
+    # if args.fp16:
+    #     model, optimizer = amp.initialize(model, optimizer,
+    #                                   opt_level="O2",
+    #                                   loss_scale='dynamic'
+    #                                   )
+    # model = apexDDP(model)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+    model = torchDDP(model, device_ids=[args.rank])
+    return model, optimizer, scheduler, scaler
 
 def get_batch(data_iterator, iteration):
     data = data_iterator.get_batch(iteration)
@@ -306,7 +307,7 @@ def forward_step(data_iterator, model, mems, iteration, args):
     root_mask = cl_target!=target
     input_root = args.input_root and class_prediction
 
-    hypernym_input = cl_data*(cl_data != data)
+    hypernym_input = cl_data*(cl_data != data) if args.learn_offset else None
     if class_prediction:
         if input_root:
             ret = model(cl_data, target, cl_target, mems, args, class_prediction=True)
@@ -329,36 +330,46 @@ def forward_step(data_iterator, model, mems, iteration, args):
     non_cl_loss = lm_loss[~root_mask]
     return lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems
 
-def backward_step(optimizer, model, lm_loss, auxiliary_loss, args):
+def backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args):
     if args.multi_obj:
         loss = 0.8*lm_loss + 0.2*auxiliary_loss
     else:
         loss = lm_loss
     optimizer.zero_grad()
-    if args.fp16:
-        with amp.scale_loss(loss, optimizer) as scaled_loss:
-            scaled_loss.backward()
-        # optimizer.backward(loss, update_master_grads=False)
-    else:
-        loss.backward()
+
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+    # for name, param in model.named_parameters():
+    #     if param.grad is None:
+    #         print(name)
+    scaler.step(optimizer)
+    scaler.update()
+    # if args.fp16:
+    #     with amp.scale_loss(loss, optimizer) as scaled_loss:
+    #         scaled_loss.backward()
+    # else:
+    #     loss.backward()
     
     lm_loss_reduced = get_reduced_loss(lm_loss, args.world_size)
     auxiliary_loss_reduced = get_reduced_loss(auxiliary_loss, args.world_size)
 
-    if args.fp16:
-        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
-    else:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+    # if args.fp16:
+    #     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
+    # else:
+    #     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
 
     return lm_loss_reduced, auxiliary_loss_reduced
 
-def train_step(data_iterator, mems, model, optimizer, lr_scheduler, iteration, args):
+def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args):
+    with autocast(enabled=args.fp16):
 
-    lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
-    lm_loss = lm_loss.float().mean().type_as(lm_loss)
-    auxiliary_loss = auxiliary_loss.float().mean().type_as(auxiliary_loss)
-    lm_loss_reduced, auxiliary_loss_reduced = backward_step(optimizer, model, lm_loss, auxiliary_loss, args)
-    optimizer.step()
+        lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
+        lm_loss = lm_loss.mean().type_as(lm_loss)
+        auxiliary_loss = auxiliary_loss.mean().type_as(auxiliary_loss)
+
+    lm_loss_reduced, auxiliary_loss_reduced = backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args)
+    # optimizer.step()
 
     if iteration < args.warmup_step:
         curr_lr = args.lr * iteration / args.warmup_step
@@ -373,7 +384,7 @@ def train_step(data_iterator, mems, model, optimizer, lr_scheduler, iteration, a
 
     return lm_loss_reduced, auxiliary_loss_reduced, cl_lm_loss_reduced, non_cl_lm_loss_reduced, new_mems
 
-def train(model, optimizer, lr_scheduler, corpus, train_data_iterator, val_data_iterator, args):
+def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, val_data_iterator, args):
     # Turn on training mode which enables dropout.
     # global train_step, train_loss, best_val_loss, eval_start_time, log_start_time
     model.train()
@@ -425,7 +436,7 @@ def train(model, optimizer, lr_scheduler, corpus, train_data_iterator, val_data_
         # if hypernym_grad and args.learn_offset and iteration>args.cl_steps:
         #     model.module.change()
         #     hypernym_grad = False
-        lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = train_step(train_data_iterator, mems, model, optimizer, lr_scheduler, iteration, args)
+        lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = train_step(train_data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args)
         iteration += 1
         current_lm_loss = lm_loss.data.detach().float().item()
         total_lm_loss += current_lm_loss
@@ -652,7 +663,7 @@ def main():
 
     torch.distributed.barrier()
 
-    model, optimizer, scheduler = setup_model_and_optimizer(args)
+    model, optimizer, scheduler, scaler = setup_model_and_optimizer(args)
 
     args.eval_batch_size = 10
     tr_iter, va_iter, te_iter = None, None, None
@@ -664,7 +675,7 @@ def main():
         device=device, ext_len=args.ext_len,rank=0, world_size=1)
 
     if args.do_train:
-        train(model, optimizer, scheduler, corpus, tr_iter, va_iter, args)
+        train(model, optimizer, scheduler, scaler, corpus, tr_iter, va_iter, args)
     if args.do_eval and args.checkpoint_dir:
         for checkpoint_name in glob.glob(os.path.join(args.checkpoint_dir,'iter_*/model_optim_rng.pt')):
             iteration = load_checkpoint(model, optimizer, scheduler, args, checkpoint_name=checkpoint_name)

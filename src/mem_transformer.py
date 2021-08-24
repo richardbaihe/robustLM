@@ -35,6 +35,9 @@ class PositionalEmbedding(nn.Module):
         self.register_buffer('inv_freq', inv_freq)
 
     def forward(self, pos_seq, bsz=None, sega=False):
+        if torch.is_autocast_enabled():
+            self.inv_freq = self.inv_freq.half()
+            pos_seq=pos_seq.half()
         if sega:
             sinusoid_inp = torch.bmm(pos_seq.unsqueeze(-1),
                                      self.inv_freq.unsqueeze(0).unsqueeze(0).expand(pos_seq.size(0), -1, -1))
@@ -675,6 +678,8 @@ class AdaptiveEmbedding(nn.Module):
                 self.emb_layers.append(nn.Embedding(r_idx-l_idx, d_emb_i))
                 self.emb_projs.append(nn.Parameter(
                     torch.Tensor(d_proj, d_emb_i)))
+        self.register_buffer("_float_tensor", torch.FloatTensor(1))
+        self.register_buffer("_half_tensor", torch.HalfTensor(1))
 
     def forward(self, inp):
         if self.div_val == 1:
@@ -682,30 +687,55 @@ class AdaptiveEmbedding(nn.Module):
             if self.d_proj != self.d_embed:
                 embed = F.linear(embed, self.emb_projs[0])
         else:
-            param = next(self.parameters())
             inp_flat = inp.reshape(-1)
-            emb_flat = torch.zeros([inp_flat.size(0), self.d_proj],
-                                   dtype=param.dtype, device=param.device)
+            if torch.is_autocast_enabled():
+                emb_flat = self._half_tensor.new(inp_flat.shape + (self.d_proj,))
+            else:
+                emb_flat = self._float_tensor.new(inp_flat.shape + (self.d_proj,))
+
             for i in range(len(self.cutoffs)):
-                l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
-
-                mask_i = (inp_flat >= l_idx) & (inp_flat < r_idx)
-                indices_i = mask_i.nonzero().squeeze()
-
-                if indices_i.numel() == 0:
-                    continue
-
-                inp_i = inp_flat.index_select(0, indices_i) - l_idx
-                emb_i = self.emb_layers[i](inp_i)
-                emb_i = F.linear(emb_i, self.emb_projs[i])
-
-                emb_flat.index_copy_(0, indices_i, emb_i)
-
+                mask = inp_flat.lt(self.cutoffs[i])
+                if i > 0:
+                    mask.mul_(inp_flat.ge(self.cutoffs[i - 1]))
+                    chunk_input = inp_flat[mask] - self.cutoffs[i - 1]
+                else:
+                    chunk_input = inp_flat[mask]
+                if mask.any():
+                    emb_i = self.emb_layers[i](chunk_input)
+                    emb_flat[mask]=F.linear(emb_i, self.emb_projs[i])
             embed = emb_flat.view(*inp.size(), self.d_proj)
-
         embed.mul_(self.emb_scale)
-
         return embed
+    # def forward(self, inp):
+    #     if self.div_val == 1:
+    #         embed = self.emb_layers[0](inp)
+    #         if self.d_proj != self.d_embed:
+    #             embed = F.linear(embed, self.emb_projs[0])
+    #     else:
+    #         param = next(self.parameters())
+    #         inp_flat = inp.reshape(-1)
+    #         emb_flat = torch.zeros([inp_flat.size(0), self.d_proj],
+    #                                dtype=torch.float16 if torch.is_autocast_enabled() else param.dtype, device=param.device)
+    #         for i in range(len(self.cutoffs)):
+    #             l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
+
+    #             mask_i = (inp_flat >= l_idx) & (inp_flat < r_idx)
+    #             indices_i = mask_i.nonzero().squeeze()
+
+    #             if indices_i.numel() == 0:
+    #                 continue
+
+    #             inp_i = inp_flat.index_select(0, indices_i) - l_idx
+    #             emb_i = self.emb_layers[i](inp_i)
+    #             emb_i = F.linear(emb_i, self.emb_projs[i])
+
+    #             emb_flat.index_copy_(0, indices_i, emb_i)
+
+    #         embed = emb_flat.view(*inp.size(), self.d_proj)
+
+    #     embed.mul_(self.emb_scale)
+
+    #     return embed
 
 
 def get_ith_embed_layer_given_index(index, word_emb):
@@ -725,7 +755,8 @@ class MemTransformerLM(nn.Module):
                  cutoffs=[], adapt_inp=False,
                  same_length=False, attn_type=0, clamp_len=-1,
                  sample_softmax=-1, cl_all_root_index=None, cl_all_leaf_index=None,
-                 adaptive_class_softmax=False, cl_root_leaf_dict=None, word2class_id=None):
+                 adaptive_class_softmax=False, cl_root_leaf_dict=None, word2class_id=None,
+                 mix_vocab=True):
         super(MemTransformerLM, self).__init__()
         # if word2class_id:
         #     n_token = n_token-len(cl_root_leaf_dict)
@@ -746,10 +777,10 @@ class MemTransformerLM(nn.Module):
         # else:
         self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs,
                                         div_val=div_val)
-            
-        self.auxiliary_projection_layer = nn.Linear(d_model, d_model)
-        self.auxiliary_output_layer = nn.Linear(
-            d_model, len(cl_all_root_index))
+        if not mix_vocab:
+            self.auxiliary_projection_layer = nn.Linear(d_model, d_model)
+            self.auxiliary_output_layer = nn.Linear(
+                d_model, len(cl_all_root_index))
         self.cl_root_vocab = {}
         self.drop = nn.Dropout(dropout)
 

@@ -321,6 +321,16 @@ class MixLMOrderedIterator(LMOrderedIterator):
 
         cl_data = self.data_cl[beg_idx:end_idx, start:end]
         cl_target = self.data_cl[i+1:i+1+seq_len, start:end]
+        while data.max()<200000 or cl_data.max()<200000:
+            i = (i+100)%self.n_batch
+            end_idx = i + seq_len
+            beg_idx = max(0, i - self.ext_len)
+            data = self.data[beg_idx:end_idx, start:end]
+            target = self.data[i+1:i+1+seq_len, start:end]
+
+            cl_data = self.data_cl[beg_idx:end_idx, start:end]
+            cl_target = self.data_cl[i+1:i+1+seq_len, start:end]
+        
         # pst = tuple()
         # if self.sega:
         #     pst = (self.p[beg_idx:end_idx], self.s[beg_idx:end_idx],self.t[beg_idx:end_idx])

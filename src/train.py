@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.optim as optim
 from fp16 import FP16_Module
 from fp16 import FP16_Optimizer
-from torch.cuda.amp import autocast
+# from torch.cuda.amp import autocast
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from apex.parallel import DistributedDataParallel as apexDDP
 from apex.optimizers import FusedAdam as Adam
@@ -30,7 +30,7 @@ from utils.exp_utils import create_exp_dir, \
     print_rank_0, save_checkpoint, load_checkpoint, get_params_for_weight_decay_optimization
 from mem_transformer import MemTransformerLM, SegaMemTransformerLM
 
-
+torch.autograd.set_detect_anomaly(True)
 def initialize_distributed(args):
     """Initialize torch.distributed."""
 
@@ -245,14 +245,15 @@ def setup_model_and_optimizer(args):
     if args.load_lastest:
         args.iteration = load_checkpoint(model, optimizer, scheduler, args, best=False)
     
-    # if args.fp16:
-    #     model, optimizer = amp.initialize(model, optimizer,
-    #                                   opt_level="O2",
-    #                                   loss_scale='dynamic'
-    #                                   )
-    # model = apexDDP(model)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
-    model = torchDDP(model, device_ids=[args.rank])
+    if args.fp16:
+        model, optimizer = amp.initialize(model, optimizer,
+                                      opt_level="O2",
+                                      loss_scale='dynamic'
+                                      )
+    model = apexDDP(model)
+    scaler = None
+    # scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+    # model = torchDDP(model, device_ids=[args.rank])
     return model, optimizer, scheduler, scaler
 
 def get_batch(data_iterator, iteration):
@@ -337,39 +338,35 @@ def backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args):
         loss = lm_loss
     optimizer.zero_grad()
 
-    scaler.scale(loss).backward()
-    scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-    # for name, param in model.named_parameters():
-    #     if param.grad is None:
-    #         print(name)
-    scaler.step(optimizer)
-    scaler.update()
-    # if args.fp16:
-    #     with amp.scale_loss(loss, optimizer) as scaled_loss:
-    #         scaled_loss.backward()
-    # else:
-    #     loss.backward()
+    # scaler.scale(loss).backward()
+    # scaler.unscale_(optimizer)
+    # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+
+    # scaler.step(optimizer)
+    # scaler.update()
+    if args.fp16:
+        with amp.scale_loss(loss, optimizer) as scaled_loss:
+            scaled_loss.backward()
+    else:
+        loss.backward()
     
     lm_loss_reduced = get_reduced_loss(lm_loss, args.world_size)
     auxiliary_loss_reduced = get_reduced_loss(auxiliary_loss, args.world_size)
 
-    # if args.fp16:
-    #     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
-    # else:
-    #     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+    if args.fp16:
+        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
+    else:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
 
     return lm_loss_reduced, auxiliary_loss_reduced
 
 def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args):
-    with autocast(enabled=args.fp16):
-
-        lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
-        lm_loss = lm_loss.mean().type_as(lm_loss)
-        auxiliary_loss = auxiliary_loss.mean().type_as(auxiliary_loss)
+    lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
+    lm_loss = lm_loss.mean().type_as(lm_loss)
+    auxiliary_loss = auxiliary_loss.mean().type_as(auxiliary_loss)
 
     lm_loss_reduced, auxiliary_loss_reduced = backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args)
-    # optimizer.step()
+    optimizer.step()
 
     if iteration < args.warmup_step:
         curr_lr = args.lr * iteration / args.warmup_step

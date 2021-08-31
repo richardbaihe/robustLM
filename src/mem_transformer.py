@@ -35,11 +35,6 @@ class PositionalEmbedding(nn.Module):
         self.register_buffer('inv_freq', inv_freq)
 
     def forward(self, pos_seq, bsz=None, sega=False):
-        if torch.is_autocast_enabled():
-            self.inv_freq = self.inv_freq.half()
-            pos_seq=pos_seq.half()
-        else:
-            self.inv_freq = self.inv_freq.float()
         if sega:
             sinusoid_inp = torch.bmm(pos_seq.unsqueeze(-1),
                                      self.inv_freq.unsqueeze(0).unsqueeze(0).expand(pos_seq.size(0), -1, -1))
@@ -332,150 +327,6 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
         return output, attn_score
 
 
-'''
-class LongformerRelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
-    def __init__(self, *args, **kwargs):
-        super(LongformerRelPartialLearnableMultiHeadAttn, self).__init__(*args, **kwargs)
-        self.r_net = nn.Linear(self.d_model, self.n_head * self.d_head, bias=False)
-
-    def forward(self, w, r, r_w_bias, r_r_bias, attn_mask=None, mems=None, sega=False,
-                attention_window=1,attention_dilation=1):
-        qlen, rlen, bsz = w.size(0), r.size(0), w.size(1)
-        if attn_mask is not None:
-            # batch q_len k_len 1
-            # attention_mask = attention_mask.squeeze(-1)
-            key_padding_mask = attn_mask == 1
-            #ones = key_padding_mask.new_ones(size=key_padding_mask.size())  # tensor of ones
-            #key_padding_mask = diagonaled_mm_tvm(ones, key_padding_mask, attention_window, attention_dilation, False, 0, True)
-            extra_attention_mask = attn_mask == 2
-            remove_from_windowed_attention_mask = attn_mask != 1
-
-            num_extra_indices_per_batch = extra_attention_mask.long().sum(dim=1)
-            max_num_extra_indices_per_batch = num_extra_indices_per_batch.max()
-            if max_num_extra_indices_per_batch <= 0:
-                extra_attention_mask = None
-            else:
-                # To support the case of variable number of global attention in the rows of a batch,
-                # we use the following three selection masks to select global attention embeddings
-                # in a 3d tensor and pad it to `max_num_extra_indices_per_batch`
-                # 1) selecting embeddings that correspond to global attention
-                extra_attention_mask_nonzeros = extra_attention_mask.nonzero(as_tuple=True)
-                zero_to_max_range = torch.arange(0, max_num_extra_indices_per_batch,
-                                                 device=num_extra_indices_per_batch.device)
-                # mask indicating which values are actually going to be padding
-                selection_padding_mask = zero_to_max_range < num_extra_indices_per_batch.unsqueeze(dim=-1)
-                # 2) location of the non-padding values in the selected global attention
-                selection_padding_mask_nonzeros = selection_padding_mask.nonzero(as_tuple=True)
-                # 3) location of the padding values in the selected global attention
-                selection_padding_mask_zeros = (selection_padding_mask == 0).nonzero(as_tuple=True)
-        else:
-            remove_from_windowed_attention_mask = None
-            extra_attention_mask = None
-            key_padding_mask = None
-
-
-
-        if mems is not None:
-            cat = torch.cat([mems, w], 0)
-            if self.pre_lnorm:
-                w_heads = self.qkv_net(self.layer_norm(cat))
-            else:
-                w_heads = self.qkv_net(cat)
-            r_head_k = self.r_net(r)
-
-            w_head_q, w_head_k, w_head_v = torch.chunk(w_heads, 3, dim=-1)
-            w_head_q = w_head_q[-qlen:]
-        else:
-            if self.pre_lnorm:
-                w_heads = self.qkv_net(self.layer_norm(w))
-            else:
-                w_heads = self.qkv_net(w)
-            r_head_k = self.r_net(r)
-
-            w_head_q, w_head_k, w_head_v = torch.chunk(w_heads, 3, dim=-1)
-
-        klen = w_head_k.size(0)
-
-        w_head_q = w_head_q.view(qlen, bsz, self.n_head, self.d_head)       # qlen x bsz x n_head x d_head
-        w_head_k = w_head_k.view(klen, bsz, self.n_head, self.d_head)           # qlen x bsz x n_head x d_head
-        w_head_v = w_head_v.view(klen, bsz, self.n_head, self.d_head)           # qlen x bsz x n_head x d_head
-
-        if sega:
-            r_head_k = r_head_k.view(rlen, bsz, self.n_head, self.d_head)
-        else:
-            r_head_k = r_head_k.view(rlen, self.n_head, self.d_head)                # qlen x n_head x d_head
-
-        #### compute attention score
-        rw_head_q = w_head_q + r_w_bias                                         # qlen x bsz x n_head x d_head
-        # AC = torch.einsum('ibnd,jbnd->ijbn', (rw_head_q, w_head_k))             # qlen x klen x bsz x n_head
-        AC =  diagonaled_mm_tvm(rw_head_q.transpose(0,1).contiguous(),
-                                w_head_k.transpose(0,1).contiguous(),
-                                attention_window, attention_dilation,False,0,True)            # batch qlen n_head w+1
-        rr_head_q = w_head_q + r_r_bias
-        if sega:
-            BD = diagonaled_mm_tvm(rr_head_q.transpose(0,1).contiguous(),
-                                   r_head_k.transpose(0,1).contiguous(),attention_window,
-                                   attention_dilation,False,0,True)            # batch qlen n_head w+1
-            # BD = torch.einsum('ibnd,jbnd->ijbn', (rr_head_q, r_head_k))
-        else:
-            r_head_k = r_head_k.transpose(0,1).unsqueeze().repeat(bsz,1,1,1).contiguous()     # bsz n_head qlen d_head
-            BD = diagonaled_mm_tvm(rr_head_q.transpose(0, 1).contiguous(), r_head_k, attention_window,
-                                   attention_dilation, False, 0, True)  # batch qlen n_head w+1
-            # BD = torch.einsum('ibnd,jnd->ijbn', (rr_head_q, r_head_k))              # qlen x klen x bsz x n_head
-        BD = self._rel_shift(BD)
-
-        # [bsz x qlen x n_head x w+1]
-        attn_score = AC + BD
-        mask_invalid_locations(attn_score, attention_window, attention_dilation, True)
-        # TODO
-        # if remove_from_windowed_attention_mask is not None:
-        #     # This implementation is fast and takes very little memory because num_heads x hidden_size = 1
-        #     # from (bsz x seq_len) to (bsz x seq_len x num_heads x hidden_size)
-        #     # remove_from_windowed_attention_mask = remove_from_windowed_attention_mask.unsqueeze(dim=-1).unsqueeze(dim=-1)
-        #     # cast to float/half then replace 1's with -inf
-        #     float_mask = remove_from_windowed_attention_mask.type_as(attn_score).masked_fill(remove_from_windowed_attention_mask, -10000.0)
-        #     #repeat_size = 1 if isinstance(attention_dilation, int) else len(attention_dilation)
-        #     #float_mask = float_mask.repeat(1, 1, repeat_size, 1)
-        #     ones = float_mask.new_ones(size=float_mask.size())  # tensor of ones
-        #     # diagonal mask with zeros everywhere and -inf inplace of padding
-        #     d_mask = diagonaled_mm_tvm(ones, float_mask, attention_window, attention_dilation, False, 0, True)
-        #     attn_score += d_mask
-        if extra_attention_mask is not None:
-            raise NotImplementedError
-
-        attn_score.mul_(self.scale)
-
-        attn_weights_float = F.softmax(attn_score, dim=-1, dtype=torch.float32)  # use fp32 for numerical stability
-        # TODO
-        # if key_padding_mask is not None:
-        #     # softmax sometimes inserts NaN if all positions are masked, replace them with 0
-        #     attn_weights_float = torch.masked_fill(attn_weights_float, key_padding_mask,
-        #                                            0.0)
-
-        attn_score = attn_weights_float.type_as(attn_score)
-        attn_prob = self.dropatt(attn_score)
-
-        w_head_v = w_head_v.transpose(0,1).float().contiguous()
-        attn_vec = diagonaled_mm_tvm(attn_prob,w_head_v,attention_window,attention_dilation,True,0,True)
-        attn_vec = attn_vec.contiguous().transpose(0,1)
-        attn_vec = attn_vec.view(
-            attn_vec.size(0), attn_vec.size(1), self.n_head * self.d_head)  # [qlen x bsz x n_head x d_head]
-
-        ##### linear projection
-        attn_out = self.o_net(attn_vec)
-        attn_out = self.drop(attn_out)
-
-        if self.pre_lnorm:
-            ##### residual connection
-            output = w + attn_out
-        else:
-            ##### residual connection + layer normalization
-            output = self.layer_norm(w + attn_out)
-
-        return output
-'''
-
-
 class RelLearnableMultiHeadAttn(RelMultiHeadAttn):
     def __init__(self, *args, **kwargs):
         super(RelLearnableMultiHeadAttn, self).__init__(*args, **kwargs)
@@ -626,28 +477,6 @@ class RelPartialLearnableDecoderLayer(nn.Module):
         return output, attn_score
 
 
-'''
-class LongformerRelPartialLearnableDecoderLayer(nn.Module):
-    def __init__(self, n_head, d_model, d_head, d_inner, dropout,
-                 **kwargs):
-        super(LongformerRelPartialLearnableDecoderLayer, self).__init__()
-
-        self.dec_attn = LongformerRelPartialLearnableMultiHeadAttn(n_head, d_model,
-                            d_head, dropout, **kwargs)
-        self.pos_ff = PositionwiseFF(d_model, d_inner, dropout,
-                                     pre_lnorm=kwargs.get('pre_lnorm'))
-
-    def forward(self, dec_inp, r, r_w_bias, r_r_bias, dec_attn_mask=None, mems=None, sega=False,attention_window=1):
-
-        output = self.dec_attn(dec_inp, r, r_w_bias, r_r_bias,
-                               attn_mask=dec_attn_mask,
-                               mems=mems,sega=sega,attention_window=attention_window)
-        output = self.pos_ff(output)
-
-        return output
-'''
-
-
 class AdaptiveEmbedding(nn.Module):
     def __init__(self, n_token, d_embed, d_proj, cutoffs, div_val=1,
                  sample_softmax=False):
@@ -681,7 +510,6 @@ class AdaptiveEmbedding(nn.Module):
                 self.emb_projs.append(nn.Parameter(
                     torch.Tensor(d_proj, d_emb_i)))
         self.register_buffer("_float_tensor", torch.FloatTensor(1))
-        self.register_buffer("_half_tensor", torch.HalfTensor(1))
 
     def forward(self, inp):
         if self.div_val == 1:
@@ -689,11 +517,9 @@ class AdaptiveEmbedding(nn.Module):
             if self.d_proj != self.d_embed:
                 embed = F.linear(embed, self.emb_projs[0])
         else:
+            param = next(self.parameters())
             inp_flat = inp.reshape(-1)
-            if torch.is_autocast_enabled():
-                emb_flat = self._half_tensor.new(inp_flat.shape + (self.d_proj,))
-            else:
-                emb_flat = self._float_tensor.new(inp_flat.shape + (self.d_proj,))
+            emb_flat = self._float_tensor.new(inp_flat.shape + (self.d_proj,))
 
             for i in range(len(self.cutoffs)):
                 mask = inp_flat.lt(self.cutoffs[i])
@@ -706,38 +532,11 @@ class AdaptiveEmbedding(nn.Module):
                     emb_i = self.emb_layers[i](chunk_input)
                     emb_flat[mask]=F.linear(emb_i, self.emb_projs[i])
             embed = emb_flat.view(*inp.size(), self.d_proj)
+
         embed.mul_(self.emb_scale)
+
         return embed
-    # def forward(self, inp):
-    #     if self.div_val == 1:
-    #         embed = self.emb_layers[0](inp)
-    #         if self.d_proj != self.d_embed:
-    #             embed = F.linear(embed, self.emb_projs[0])
-    #     else:
-    #         param = next(self.parameters())
-    #         inp_flat = inp.reshape(-1)
-    #         emb_flat = torch.zeros([inp_flat.size(0), self.d_proj],
-    #                                dtype=torch.float16 if torch.is_autocast_enabled() else param.dtype, device=param.device)
-    #         for i in range(len(self.cutoffs)):
-    #             l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
 
-    #             mask_i = (inp_flat >= l_idx) & (inp_flat < r_idx)
-    #             indices_i = mask_i.nonzero().squeeze()
-
-    #             if indices_i.numel() == 0:
-    #                 continue
-
-    #             inp_i = inp_flat.index_select(0, indices_i) - l_idx
-    #             emb_i = self.emb_layers[i](inp_i)
-    #             emb_i = F.linear(emb_i, self.emb_projs[i])
-
-    #             emb_flat.index_copy_(0, indices_i, emb_i)
-
-    #         embed = emb_flat.view(*inp.size(), self.d_proj)
-
-    #     embed.mul_(self.emb_scale)
-
-    #     return embed
 
 
 def get_ith_embed_layer_given_index(index, word_emb):
@@ -2251,301 +2050,6 @@ class Sega_wo_s_MemTransformerLM(nn.Module):
         else:
             return [loss] + new_mems
 
-
-'''
-class LongTransformerLM(nn.Module):
-    def __init__(self, n_token, n_layer, n_head, d_model, d_head, d_inner,
-                 dropout, dropatt, tie_weight=True, d_embed=None,
-                 div_val=1, tie_projs=[False], pre_lnorm=False,
-                 tgt_len=None, ext_len=None, mem_len=None,
-                 cutoffs=[], adapt_inp=False,
-                 same_length=False, attn_type=0, clamp_len=-1,
-                 sample_softmax=-1, window_size=5,dilation_size=1):
-        super(LongTransformerLM, self).__init__()
-        self.n_token = n_token
-
-        d_embed = d_model if d_embed is None else d_embed
-        self.d_embed = d_embed
-        self.d_model = d_model
-        self.n_head = n_head
-        self.d_head = d_head
-
-        self.window_size = window_size
-        self.dilation_size = dilation_size
-
-        self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs,
-                                          div_val=div_val)
-
-        self.drop = nn.Dropout(dropout)
-
-        self.n_layer = n_layer
-
-        self.tgt_len = tgt_len
-        self.mem_len = mem_len
-        self.ext_len = ext_len
-        self.max_klen = tgt_len + ext_len + mem_len
-
-        self.attn_type = attn_type
-
-        self.layers = nn.ModuleList()
-        if attn_type == 0: # the default attention
-            for i in range(n_layer):
-                self.layers.append(
-                    LongformerRelPartialLearnableDecoderLayer(
-                        n_head, d_model, d_head, d_inner, dropout,
-                        tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
-                        dropatt=dropatt, pre_lnorm=pre_lnorm)
-                )
-        else:
-            raise NotImplementedError
-
-        self.sample_softmax = sample_softmax
-        # use sampled softmax
-        if sample_softmax > 0:
-            self.out_layer = nn.Linear(d_model, n_token)
-            if tie_weight:
-                self.out_layer.weight = self.word_emb.weight
-            self.tie_weight = tie_weight
-            self.sampler = LogUniformSampler(n_token, sample_softmax)
-
-        # use adaptive softmax (including standard softmax)
-        else:
-            self.crit = ProjectedAdaptiveLogSoftmax(n_token, d_embed, d_model,
-                                                    cutoffs, div_val=div_val)
-
-            if tie_weight:
-                for i in range(len(self.crit.out_layers)):
-                    self.crit.out_layers[i].weight = self.word_emb.emb_layers[i].weight
-
-            if tie_projs:
-                for i, tie_proj in enumerate(tie_projs):
-                    if tie_proj and div_val == 1 and d_model != d_embed:
-                        self.crit.out_projs[i] = self.word_emb.emb_projs[0]
-                    elif tie_proj and div_val != 1:
-                        self.crit.out_projs[i] = self.word_emb.emb_projs[i]
-
-        self.same_length = same_length
-        self.clamp_len = clamp_len
-
-        self._create_params()
-
-    def backward_compatible(self):
-        self.sample_softmax = -1
-
-    def _create_params(self):
-        if self.attn_type == 0: # default attention
-            t_pos_size = self.d_model//3 + self.d_model//3%2
-            s_pos_size = self.d_model//3 + self.d_model//3%2
-            p_pos_size = self.d_model - t_pos_size - s_pos_size
-            self.t_pos_emb = PositionalEmbedding(t_pos_size)
-            self.s_pos_emb = PositionalEmbedding(s_pos_size)
-            self.p_pos_emb = PositionalEmbedding(p_pos_size)
-            self.r_w_bias = nn.Parameter(torch.Tensor(self.n_head, self.d_head))
-            self.r_r_bias = nn.Parameter(torch.Tensor(self.n_head, self.d_head))
-        elif self.attn_type == 1: # learnable
-            self.r_emb = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head, self.d_head))
-            self.r_w_bias = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.n_head, self.d_head))
-            self.r_bias = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head))
-        elif self.attn_type == 2: # absolute standard
-            self.pos_emb = PositionalEmbedding(self.d_model)
-        elif self.attn_type == 3: # absolute deeper SA
-            self.r_emb = nn.Parameter(torch.Tensor(
-                    self.n_layer, self.max_klen, self.n_head, self.d_head))
-
-    def reset_length(self, tgt_len, ext_len, mem_len):
-        self.tgt_len = tgt_len
-        self.mem_len = mem_len
-        self.ext_len = ext_len
-
-    def init_mems(self):
-        if self.mem_len > 0:
-            mems = []
-            param = next(self.parameters())
-            for i in range(self.n_layer+1):
-                empty = torch.empty(0, dtype=param.dtype, device=param.device)
-                mems.append(empty)
-
-            return mems
-        else:
-            return None
-
-    def init_mems_pst(self):
-        if self.mem_len > 0:
-            param = next(self.parameters())
-            mems_pst=(torch.empty(0, dtype=torch.int64, device=param.device),
-                      torch.empty(0, dtype=torch.int64, device=param.device),
-                      torch.empty(0, dtype=torch.int64, device=param.device))
-            return mems_pst
-        else:
-            return None
-
-    def _update_mems(self, hids, mems, qlen, mlen):
-        # does not deal with None
-        if mems is None: return None
-
-        # mems is not None
-        assert len(hids) == len(mems), 'len(hids) != len(mems)'
-
-        # There are `mlen + qlen` steps that can be cached into mems
-        # For the next step, the last `ext_len` of the `qlen` tokens
-        # will be used as the extended context. Hence, we only cache
-        # the tokens from `mlen + qlen - self.ext_len - self.mem_len`
-        # to `mlen + qlen - self.ext_len`.
-        with torch.no_grad():
-            new_mems = []
-            end_idx = mlen + max(0, qlen - 0 - self.ext_len)
-            beg_idx = max(0, end_idx - self.mem_len)
-            for i in range(len(hids)):
-
-                cat = torch.cat([mems[i], hids[i]], dim=0)
-                new_mems.append(cat[beg_idx:end_idx].detach())
-        return new_mems
-
-    def _forward(self, dec_inp, mems=None, pst=None, mems_pst=None):
-        qlen, bsz = dec_inp.size()
-
-        word_emb = self.word_emb(dec_inp)
-
-        mlen = mems[0].size(0) if mems is not None else 0
-        klen = mlen + qlen
-        all_ones = word_emb.new_ones(qlen, klen)
-        if self.same_length:
-            mask_len = klen - self.mem_len
-            if mask_len > 0:
-                mask_shift_len = qlen - mask_len
-            else:
-                mask_shift_len = qlen
-            dec_attn_mask = (torch.triu(all_ones, 1+mlen).bool() |
-                    torch.tril(all_ones, -mask_shift_len) | torch.tril(all_ones, -self.window_size-1)).byte()[:, :, None] # -1
-        else:
-            dec_attn_mask = (torch.triu(
-                all_ones, diagonal=1+mlen)+torch.tril(all_ones, -self.window_size-1)).byte()[:,:,None]
-        dec_attn_mask = dec_attn_mask.unsqueeze(0).repeat(bsz,1,1,1)
-        hids = []
-        if self.attn_type == 0: # default
-            p, s, t = pst
-            if mems_pst and mlen>0:
-                m_p, m_s, m_t = mems_pst
-                ab_t = torch.cat([m_t, t], 0)
-                ab_p = torch.cat([m_p,p],0)
-                ab_s = torch.cat([m_s,s],0)
-            else:
-                ab_t, ab_p, ab_s = t,p,s
-            max_t,_ = ab_t.max(0)
-            t_pos_seq = max_t.unsqueeze(0).expand(ab_t.size(0),-1) - ab_t
-            max_p, _ = ab_p.max(0)
-            p_pos_seq = max_p.unsqueeze(0).expand(ab_p.size(0), -1) - ab_p
-            max_s, _ = ab_s.max(0)
-            s_pos_seq = max_s.unsqueeze(0).expand(ab_s.size(0), -1) - ab_s
-            # t_pos_seq = ab_t.max(0)[0]-ab_t
-            # p_pos_seq = ab_p.max(0)[0]-ab_p
-            # s_pos_seq = ab_s.max(0)[0]-ab_s
-
-            if self.clamp_len > 0:
-                t_pos_seq.clamp_(max=self.clamp_len)
-                s_pos_seq.clamp_(max=self.clamp_len)
-                p_pos_seq.clamp_(max=self.clamp_len)
-            t_pos_emb = self.t_pos_emb(t_pos_seq.to(dtype=word_emb.dtype),sega=True)
-            s_pos_emb = self.s_pos_emb(s_pos_seq.to(dtype=word_emb.dtype),sega=True)
-            p_pos_emb = self.p_pos_emb(p_pos_seq.to(dtype=word_emb.dtype),sega=True)
-            pos_emb = torch.cat([t_pos_emb,s_pos_emb,p_pos_emb],-1)
-
-            core_out = self.drop(word_emb)
-            pos_emb = self.drop(pos_emb)
-
-            hids.append(core_out)
-            for i, layer in enumerate(self.layers):
-                mems_i = None if mems is None else mems[i]
-                core_out = layer(core_out, pos_emb, self.r_w_bias,
-                        self.r_r_bias, dec_attn_mask=dec_attn_mask,
-                                 mems=mems_i,sega=True,attention_window=self.window_size)
-                hids.append(core_out)
-        elif self.attn_type == 1: # learnable
-            core_out = self.drop(word_emb)
-            hids.append(core_out)
-            for i, layer in enumerate(self.layers):
-                if self.clamp_len > 0:
-                    r_emb = self.r_emb[i][-self.clamp_len :]
-                    r_bias = self.r_bias[i][-self.clamp_len :]
-                else:
-                    r_emb, r_bias = self.r_emb[i], self.r_bias[i]
-
-                mems_i = None if mems is None else mems[i]
-                core_out = layer(core_out, r_emb, self.r_w_bias[i],
-                        r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
-                hids.append(core_out)
-        elif self.attn_type == 2: # absolute
-            pos_seq = torch.arange(klen - 1, -1, -1.0, device=word_emb.device,
-                                   dtype=word_emb.dtype)
-            if self.clamp_len > 0:
-                pos_seq.clamp_(max=self.clamp_len)
-            pos_emb = self.pos_emb(pos_seq)
-
-            core_out = self.drop(word_emb + pos_emb[-qlen:])
-
-            hids.append(core_out)
-            for i, layer in enumerate(self.layers):
-                mems_i = None if mems is None else mems[i]
-                if mems_i is not None and i == 0:
-                    mems_i += pos_emb[:mlen]
-                core_out = layer(core_out, dec_attn_mask=dec_attn_mask,
-                                 mems=mems_i)
-                hids.append(core_out)
-        elif self.attn_type == 3:
-            core_out = self.drop(word_emb)
-
-            hids.append(core_out)
-            for i, layer in enumerate(self.layers):
-                mems_i = None if mems is None else mems[i]
-                if mems_i is not None and mlen > 0:
-                    cur_emb = self.r_emb[i][:-qlen]
-                    cur_size = cur_emb.size(0)
-                    if cur_size < mlen:
-                        cur_emb_pad = cur_emb[0:1].expand(mlen-cur_size, -1, -1)
-                        cur_emb = torch.cat([cur_emb_pad, cur_emb], 0)
-                    else:
-                        cur_emb = cur_emb[-mlen:]
-                    mems_i += cur_emb.view(mlen, 1, -1)
-                core_out += self.r_emb[i][-qlen:].view(qlen, 1, -1)
-
-                core_out = layer(core_out, dec_attn_mask=dec_attn_mask,
-                                 mems=mems_i)
-                hids.append(core_out)
-
-        core_out = self.drop(core_out)
-
-        new_mems = self._update_mems(hids, mems, mlen, qlen)
-
-        return core_out, new_mems
-
-    def forward(self, data, target, mems, pst, mems_pst):
-        # nn.DataParallel does not allow size(0) tensors to be broadcasted.
-        # So, have to initialize size(0) mems inside the model forward.
-        # Moreover, have to return new_mems to allow nn.DataParallel to piece
-        # them together.
-        if not mems: mems = self.init_mems()
-        if not mems_pst: mems_pst = self.init_mems_pst()
-        tgt_len = target.size(0)
-        hidden, new_mems = self._forward(data, mems=mems, pst=pst, mems_pst=mems_pst)
-
-        pred_hid = hidden[-tgt_len:]
-        if self.sample_softmax > 0 and self.training:
-            assert self.tie_weight
-            logit = sample_logits(self.word_emb,
-                self.out_layer.bias, target, pred_hid, self.sampler)
-            loss = -F.log_softmax(logit, -1)[:, :, 0]
-        else:
-            loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)), target.view(-1))
-            loss = loss.view(tgt_len, -1)
-
-        if new_mems is None:
-            return [loss]
-        else:
-            return [loss] + new_mems
-'''
 
 if __name__ == '__main__':
     import argparse

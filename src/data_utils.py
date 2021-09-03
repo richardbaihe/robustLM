@@ -273,12 +273,7 @@ class MixLMOrderedIterator(LMOrderedIterator):
         """
             data -- LongTensor -- the LongTensor is strictly ordered
         """
-        if rank == -1:
-            assert False, 'should not be here'
-            rank = torch.distributed.get_rank()
-        self.rank = rank
-        self.world_size = world_size
-        self.bsz = bsz*self.world_size
+        self.bsz = bsz
         self.bptt = bptt
         self.ext_len = ext_len if ext_len is not None else 0
         self.sega = isinstance(data, tuple)
@@ -314,27 +309,12 @@ class MixLMOrderedIterator(LMOrderedIterator):
         i = i*self.bptt
         end_idx = i + seq_len
         beg_idx = max(0, i - self.ext_len)
-        start = self.rank*self.bsz//self.world_size
-        end = (self.rank+1)*self.bsz//self.world_size
-        data = self.data[beg_idx:end_idx, start:end]
-        target = self.data[i+1:i+1+seq_len, start:end]
+        data = self.data[beg_idx:end_idx]
+        target = self.data[i+1:i+1+seq_len]
 
-        cl_data = self.data_cl[beg_idx:end_idx, start:end]
-        cl_target = self.data_cl[i+1:i+1+seq_len, start:end]
-        while data.max()<200000 or cl_data.max()<200000:
-            i = (i+100)%self.n_batch
-            end_idx = i + seq_len
-            beg_idx = max(0, i - self.ext_len)
-            data = self.data[beg_idx:end_idx, start:end]
-            target = self.data[i+1:i+1+seq_len, start:end]
+        cl_data = self.data_cl[beg_idx:end_idx]
+        cl_target = self.data_cl[i+1:i+1+seq_len]
 
-            cl_data = self.data_cl[beg_idx:end_idx, start:end]
-            cl_target = self.data_cl[i+1:i+1+seq_len, start:end]
-        
-        # pst = tuple()
-        # if self.sega:
-        #     pst = (self.p[beg_idx:end_idx], self.s[beg_idx:end_idx],self.t[beg_idx:end_idx])
-        # return data, target, cl_data, cl_target
         return {'input': data, 'target': target, 'cl_input': cl_data, 'cl_target': cl_target}
 
     def get_fixlen_iter(self, start=0):

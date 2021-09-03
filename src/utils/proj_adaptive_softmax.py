@@ -325,7 +325,6 @@ class ProjectedAdaptiveLogSoftmax(nn.Module):
         all_probs = all_probs.cpu()
         return all_probs
 
-
 class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
     def __init__(
         self,
@@ -383,42 +382,19 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                 )
 
         self.out_layers = nn.ModuleList()
-        self.out_projs = nn.ParameterList()
-
+        self.proj_flag = False
         if div_val == 1:
-            for i in range(len(self.cutoffs)):
-                if d_proj != d_embed:
-                    self.out_projs.append(nn.Parameter(torch.Tensor(d_proj, d_embed)))
-                else:
-                    self.out_projs.append(None)
-            # if self.learn_offset:
-            #     n_token = n_token-len(cl_all_root_index)
-            #     self.n_token = n_token
-            #     self.out_layers.append(nn.Linear(d_embed, n_token))
-            #     self.hypernym_emb = nn.Linear(
-            #         d_embed, len(cl_all_root_index)+1)
-            #     hypernym_list = []
-            #     for i in range(n_token):
-            #         if i in word2class.keys():
-            #             hypernym_list.append(word2class[i]+1-n_token)
-            #         else:
-            #             hypernym_list.append(0)
-            #     # for i in range(n_token):
-            #     #     if i in word2class:
-            #     #         hypernym_list.append(word2class[i])
-            #     #     else:
-            #     #         hypernym_list.append(0)
-            #     self.hypernym_list = hypernym_list
-            # else:
-            self.out_layers.append(nn.Linear(d_embed, n_token))
+            if d_proj != d_embed:
+                self.proj_flag=True
+                self.out_layers.append(nn.Sequential(nn.Linear(d_proj, d_embed,  bias=False),nn.Linear(d_embed, n_token)))
+            else:
+                self.out_layers.append(nn.Sequential(nn.Linear(d_embed, n_token)))
         else:
+            self.proj_flag=True
             for i in range(len(self.cutoffs)):
                 l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
                 d_emb_i = d_embed // (div_val ** i)
-
-                self.out_projs.append(nn.Parameter(torch.Tensor(d_proj, d_emb_i)))
-
-                self.out_layers.append(nn.Linear(d_emb_i, r_idx - l_idx))
+                self.out_layers.append(nn.Sequential(nn.Linear(d_proj, d_emb_i, bias=False),nn.Linear(d_emb_i, r_idx - l_idx)))
 
         self.keep_order = keep_order
 
@@ -469,12 +445,7 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
             #     logit = self._compute_logit(hidden, self.out_layer_for_offset_weight.weight,
             #                                 self.out_layer_for_offset_bias, self.out_projs[0])
             # else:
-            logit = self._compute_logit(
-                hidden,
-                self.out_layers[0].weight,
-                self.out_layers[0].bias,
-                self.out_projs[0],
-            )
+            logit = self.out_layers[0](hidden)
             if predict_root:
                 logit[:, self.cl_all_leaf_index] = -float("inf")
             else:
@@ -489,7 +460,7 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
             )
         else:
             # construct weights and biases
-            weights, biases = [], []
+            weights, biases, projs = [], [], []
             for i in range(len(self.cutoffs)):
                 if self.div_val == 1:
                     l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
@@ -497,20 +468,25 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                     #     weight_i = self.out_layer_for_offset_weight[l_idx:r_idx]
                     #     bias_i = self.out_layer_for_offset_bias[l_idx:r_idx]
                     # else:
-                    weight_i = self.out_layers[0].weight[l_idx:r_idx]
-                    bias_i = self.out_layers[0].bias[l_idx:r_idx]
+                    weight_i = self.out_layers[0][-1].weight[l_idx:r_idx]
+                    bias_i = self.out_layers[0][-1].bias[l_idx:r_idx]
+                    if self.proj_flag:
+                        projs_i = self.out_layers[0][0].weight
+                    else:
+                        projs_i = None
                 else:
-                    weight_i = self.out_layers[i].weight
-                    bias_i = self.out_layers[i].bias
-
+                    weight_i = self.out_layers[i][-1].weight
+                    bias_i = self.out_layers[i][-1].bias
+                    projs_i = self.out_layers[i][0].weight
                 if i == 0:
                     weight_i = torch.cat([weight_i, self.cluster_weight], dim=0)
                     bias_i = torch.cat([bias_i, self.cluster_bias], dim=0)
 
                 weights.append(weight_i)
                 biases.append(bias_i)
+                projs.append(projs_i)
 
-            head_weight, head_bias, head_proj = weights[0], biases[0], self.out_projs[0]
+            head_weight, head_bias, head_proj = weights[0], biases[0], projs[0]
             head_leaf_index, head_root_index = (
                 self.cl_cutoffs_leaf_index[0],
                 self.cl_cutoffs_root_index[0],
@@ -561,7 +537,7 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                 if i == 0:
                     logprob_i = head_logprob_i.gather(1, target_i[:, None]).squeeze(1)
                 else:
-                    weight_i, bias_i, proj_i = weights[i], biases[i], self.out_projs[i]
+                    weight_i, bias_i, proj_i = weights[i], biases[i], projs[i]
                     leaf_index_i, root_index_i = (
                         self.cl_cutoffs_leaf_index[i],
                         self.cl_cutoffs_root_index[i],

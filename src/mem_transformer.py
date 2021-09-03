@@ -494,30 +494,33 @@ class AdaptiveEmbedding(nn.Module):
         self.cutoff_ends = [0] + self.cutoffs
 
         self.emb_layers = nn.ModuleList()
-        self.emb_projs = nn.ParameterList()
+        # self.emb_projs = nn.ParameterList()
+        self.emb_proj_flag = False
         if div_val == 1:
-            self.emb_layers.append(
-                nn.Embedding(n_token, d_embed, sparse=sample_softmax > 0)
-            )
             if d_proj != d_embed:
-                self.emb_projs.append(nn.Parameter(
-                    torch.Tensor(d_proj, d_embed)))
+                self.emb_proj_flag=True
+                self.emb_layers.append(
+                    nn.Sequential(nn.Embedding(n_token, d_embed, sparse=sample_softmax > 0),
+                    nn.Linear(d_embed, d_proj, bias=False)))
+            else:
+                self.emb_layers.append(
+                nn.Sequential(nn.Embedding(n_token, d_embed, sparse=sample_softmax > 0)))
         else:
+            self.emb_proj_flag = True
             for i in range(len(self.cutoffs)):
                 l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i+1]
                 d_emb_i = d_embed // (div_val ** i)
-                self.emb_layers.append(nn.Embedding(r_idx-l_idx, d_emb_i))
-                self.emb_projs.append(nn.Parameter(
-                    torch.Tensor(d_proj, d_emb_i)))
+                self.emb_layers.append(nn.Sequential(
+                    nn.Embedding(r_idx-l_idx, d_emb_i),
+                    nn.Linear(d_emb_i, d_proj, bias=False)
+                    ))
         self.register_buffer("_float_tensor", torch.FloatTensor(1))
+        # self.register_buffer("_half_tensor", torch.HalfTensor(1))
 
     def forward(self, inp):
         if self.div_val == 1:
             embed = self.emb_layers[0](inp)
-            if self.d_proj != self.d_embed:
-                embed = F.linear(embed, self.emb_projs[0])
         else:
-            param = next(self.parameters())
             inp_flat = inp.reshape(-1)
             emb_flat = self._float_tensor.new(inp_flat.shape + (self.d_proj,))
 
@@ -529,8 +532,7 @@ class AdaptiveEmbedding(nn.Module):
                 else:
                     chunk_input = inp_flat[mask]
                 if mask.any():
-                    emb_i = self.emb_layers[i](chunk_input)
-                    emb_flat[mask]=F.linear(emb_i, self.emb_projs[i])
+                    emb_flat[mask]=self.emb_layers[i](chunk_input)
             embed = emb_flat.view(*inp.size(), self.d_proj)
 
         embed.mul_(self.emb_scale)
@@ -646,16 +648,16 @@ class MemTransformerLM(nn.Module):
                     old_idx: new_idx for new_idx, old_idx in enumerate(cl_all_root_index)}
             if tie_weight:
                 for i in range(len(self.crit.out_layers)):
-                    self.crit.out_layers[i].weight = self.word_emb.emb_layers[i].weight
+                    self.crit.out_layers[i][-1].weight = self.word_emb.emb_layers[i][0].weight
                 # if self.word2class:
                 #     self.crit.hypernym_emb.weight = self.hypernym_emb.weight
 
             if tie_projs:
                 for i, tie_proj in enumerate(tie_projs):
                     if tie_proj and div_val == 1 and d_model != d_embed:
-                        self.crit.out_projs[i] = self.word_emb.emb_projs[0]
+                        self.crit.out_layers[i][0] = self.word_emb.emb_layers[0][1]
                     elif tie_proj and div_val != 1:
-                        self.crit.out_projs[i] = self.word_emb.emb_projs[i]
+                        self.crit.out_layers[i][0] = self.word_emb.emb_layers[i][1]
 
         self.predict_root = False
         self.same_length = same_length
@@ -1005,6 +1007,7 @@ class MemTransformerLM(nn.Module):
             auxiliary_loss = torch.zeros_like(loss)
 
         loss = loss.view(tgt_len, -1)
+        auxiliary_loss = auxiliary_loss.view(tgt_len, -1)
         # if len(auxiliary_loss) == 0:
         #     auxiliary_loss = torch.zeros_like(loss)
         if new_mems is None:

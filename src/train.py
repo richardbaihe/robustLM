@@ -21,10 +21,9 @@ from apex import amp, optimizers
 from utils.arguments import get_args
 from data_utils import MixCorpus
 from utils.exp_utils import create_exp_dir, \
-    print_rank_0, save_checkpoint, load_checkpoint, get_params_for_weight_decay_optimization
+    print_rank_0, save_checkpoint, load_checkpoint, get_params_for_weight_decay_optimization, Timers
 from mem_transformer import MemTransformerLM, SegaMemTransformerLM
-
-torch.autograd.set_detect_anomaly(True)
+from utils.data_parallel import BalancedDataParallel
 
 def wandb_init(args):
     wandb_config = json.load(open('wandb_config.json','r'))
@@ -59,18 +58,24 @@ def get_lm_corpus(args):
         print('Producing dataset {} '.format(args.dataset))
         corpus = MixCorpus(args, **kwargs)
         torch.save(corpus, fn)
+    if args.mix_vocab:
+        args.cl_all_root_index = corpus.vocab.cl_root_tokens
+        args.cl_all_leaf_index = corpus.vocab.cl_leaf_tokens
+        word2class_id = {}
+        for k,v in corpus.vocab.word2class.items():
+            word2class_id[corpus.vocab.sym2idx[k]] = corpus.vocab.sym2idx[v]
+        args.cl_root_leaf_dict = corpus.vocab.class2words
+        args.word2class_id = word2class_id if args.learn_offset else None
+    else:
+        args.cl_all_root_index=None
+        args.cl_all_leaf_index=None
+        args.cl_root_leaf_dict=None
+        args.word2class_id=None
     #torch.save(corpus, fn)
     ntokens = torch.cuda.LongTensor([len(corpus.vocab)])
     # cl_root_tokens = torch.cuda.LongTensor(corpus.vocab.cl_root_tokens)
     # cl_leaf_tokens = torch.cuda.LongTensor(corpus.vocab.cl_leaf_tokens)
     args.n_token = ntokens.item()
-    args.cl_all_root_index = corpus.vocab.cl_root_tokens
-    args.cl_all_leaf_index = corpus.vocab.cl_leaf_tokens
-    word2class_id = {}
-    for k,v in corpus.vocab.word2class.items():
-        word2class_id[corpus.vocab.sym2idx[k]] = corpus.vocab.sym2idx[v]
-    args.cl_root_leaf_dict = corpus.vocab.class2words
-    args.word2class_id = word2class_id if args.learn_offset else None
     return corpus
 
 def get_model(args):
@@ -187,9 +192,7 @@ def get_model(args):
     return model
 
 def get_optimizer(model, args):
-    # while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
-    #     model = model.module
-    
+   
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     return optimizer
@@ -217,6 +220,16 @@ def get_learning_rate_scheduler(optimizer, args):
 
 def setup_model_and_optimizer(args):
     device = torch.device('cuda' if args.cuda else 'cpu')
+    # if args.fp16:
+    #     if not args.cuda:
+    #         print('WARNING: --fp16 requires --cuda, ignoring --fp16 option')
+    #         args.fp16 = False
+    #     else:
+    #         try:
+    #             from apex.fp16_utils import FP16_Optimizer
+    #         except:
+    #             print('WARNING: apex not installed, ignoring --fp16 option')
+    #             args.fp16 = False
     #### get model
     model = get_model(args)
     #### optimizer
@@ -226,14 +239,18 @@ def setup_model_and_optimizer(args):
     args.iteration = 0
     if args.load_lastest:
         args.iteration = load_checkpoint(model, optimizer, scheduler, args, best=False)
-    
     if args.fp16:
         model, optimizer = amp.initialize(torch.nn.Sequential(model), optimizer,
-                                      opt_level="O2",
-                                      loss_scale='dynamic')
+                                    opt_level="O2",
+                                    loss_scale='dynamic')
         model = model[0]
-    model = nn.DataParallel(model, dim=1)
-    model.forward = lambda *args, old_fwd = model.forward, input_caster = lambda tensor: tensor, output_caster = lambda tensor: tensor.to(amp._amp_state.opt_properties.options['cast_model_outputs'] if amp._amp_state.opt_properties.options.get('cast_model_outputs') is not None else torch.float32), **kwargs: amp._initialize.applier(old_fwd(*amp._initialize.applier(args, input_caster), **amp._initialize.applier(kwargs, input_caster)), output_caster)
+    if args.gpu0_bsz >= 0:
+        model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk,
+                                        model, dim=1).to(device)
+    else:
+        model = nn.DataParallel(model, dim=1).to(device)
+    if args.fp16:
+        model.forward = lambda *args, old_fwd = model.forward, input_caster = lambda tensor: tensor, output_caster = lambda tensor: tensor.to(amp._amp_state.opt_properties.options['cast_model_outputs'] if amp._amp_state.opt_properties.options.get('cast_model_outputs') is not None else torch.float32), **kwargs: amp._initialize.applier(old_fwd(*amp._initialize.applier(args, input_caster), **amp._initialize.applier(kwargs, input_caster)), output_caster)
     scaler = None
     # scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
     # model = torchDDP(model, device_ids=[args.rank])
@@ -324,6 +341,15 @@ def backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args):
         torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
     else:
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+
+    # if args.fp16:
+    #     optimizer.backward(loss)
+    # else:
+    #     loss.backward()
+    # if args.fp16:
+    #     optimizer.clip_master_grads(args.clip)
+    # else:
+    #     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
 
     return lm_loss, auxiliary_loss
 
@@ -505,7 +531,7 @@ def test(data_iterator, model, args, iteration):
     model.eval()
     eval_start_time = time.time()
     lm_loss, auxiliary_loss, cl_lm_loss, non_cl_lm_loss = evaluate(data_iterator, model, args)
-
+    val_lm_ppl, val_cl_ppl, val_non_cl_ppl = math.exp(lm_loss), math.exp(cl_lm_loss), math.exp(non_cl_lm_loss)
     log_str = '| Test at step {:>8d} |  time: {:5.2f}s | test loss {:5.2f} | auxiliary loss {:5.2f} | test ppl {:5.2f}'.format(
             iteration, (time.time() - eval_start_time),
                 lm_loss, auxiliary_loss, val_lm_ppl)
@@ -516,8 +542,6 @@ def test(data_iterator, model, args, iteration):
 
 def get_topk_pred(model, va_iter,top_k=1000):
     model.eval()
-    while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
-        model = model.module
     top_k_pred = defaultdict(list)
     mems=tuple()
     for iteration in tqdm(range(va_iter.n_batch)):
@@ -608,9 +632,6 @@ def main():
     args = get_args()
 
     wandb_init(args)
-    # writer = SummaryWriter(args.work_dir, flush_secs=30)
-
-    # Set the random seed manually for reproducibility.
     set_random_seed(args.seed)
     device = torch.device('cuda' if args.cuda else 'cpu')
 

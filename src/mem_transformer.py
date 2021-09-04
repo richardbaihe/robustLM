@@ -1,4 +1,4 @@
-import sys
+staimport sys
 import math
 import functools
 
@@ -492,7 +492,6 @@ class AdaptiveEmbedding(nn.Module):
         self.emb_scale = d_proj ** 0.5
 
         self.cutoff_ends = [0] + self.cutoffs
-
         self.emb_layers = nn.ModuleList()
         # self.emb_projs = nn.ParameterList()
         self.emb_proj_flag = False
@@ -516,6 +515,8 @@ class AdaptiveEmbedding(nn.Module):
                     ))
         self.register_buffer("_float_tensor", torch.FloatTensor(1))
         # self.register_buffer("_half_tensor", torch.HalfTensor(1))
+
+        
 
     def forward(self, inp):
         if self.div_val == 1:
@@ -572,15 +573,9 @@ class MemTransformerLM(nn.Module):
         self.d_head = d_head
 
         self.word2class = word2class_id
-        # if word2class_id:
-        #     self.word_emb = AdaptiveEmbedding(n_token-len(cl_root_leaf_dict), d_embed, d_model, cutoffs,
-        #                         div_val=div_val)
-        #     self.hypernym_emb = nn.Embedding(
-        #         len(cl_all_root_index)+1, d_embed, padding_idx=0)
-        # else:
         self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs,
                                         div_val=div_val)
-        if not mix_vocab:
+        if not mix_vocab and cl_all_root_index:
             self.auxiliary_projection_layer = nn.Linear(d_model, d_model)
             self.auxiliary_output_layer = nn.Linear(
                 d_model, len(cl_all_root_index))
@@ -973,9 +968,10 @@ class MemTransformerLM(nn.Module):
             hidden, hiddens, new_mems = self._forward(data, mems=mems)
 
         pred_hid = hidden[-tgt_len:]
-        indices = torch.reshape((target != root_target),
-                                (-1,)).nonzero().squeeze()
+
         if class_prediction:
+            indices = torch.reshape((target != root_target),
+                    (-1,)).nonzero().squeeze()
             if multi_obj:
                 # predict both the normal targets for all tokens and then, predict the root labels for the leaf nodes
                 loss = self.crit(torch.reshape(
@@ -984,23 +980,27 @@ class MemTransformerLM(nn.Module):
                     auxiliary_loss = self.crit(torch.reshape(
                         pred_hid, (-1, pred_hid.size(-1))), torch.reshape(root_target, (-1,)), predict_root=True)
                     auxiliary_loss = torch.reshape(
-                        auxiliary_loss, (-1,)).index_select(0, indices)
+                        loss, (-1,)) * torch.reshape((target != root_target),
+                    (-1,))
                 else:
                     auxiliary_loss = self.auxiliary_forward(
                         hiddens, indices, root_target, tgt_len, auxiliary_layer)
+                    auxiliary_loss = torch.zeros_like(loss).index_copy_(0, indices, auxiliary_loss)
             else:
                 # predict the normal targets only for non-leaf nodes and root labels for the leaf nodes
                 if mix_vocab:
                     loss = self.crit(torch.reshape(pred_hid, (-1, pred_hid.size(-1))),
                                      torch.reshape(root_target, (-1,)), predict_root=True)
                     auxiliary_loss = torch.reshape(
-                        loss, (-1,)).index_select(0, indices)
+                        loss, (-1,)) * torch.reshape((target != root_target),
+                    (-1,))
                 else:
                     loss = self.crit(torch.reshape(pred_hid, (-1, pred_hid.size(-1))),
                                      torch.reshape(root_target, (-1,)), predict_root=False)
                     auxiliary_loss = self.auxiliary_forward(
                         hiddens, indices, root_target, tgt_len, auxiliary_layer)
                     loss.index_copy_(0, indices, auxiliary_loss)
+                    auxiliary_loss = torch.zeros_like(loss).index_copy_(0, indices, auxiliary_loss)
         else:
             loss = self.crit(torch.reshape(
                 pred_hid, (-1, pred_hid.size(-1))), torch.reshape(target, (-1,)))

@@ -1,4 +1,4 @@
-staimport sys
+import sys
 import math
 import functools
 
@@ -1740,7 +1740,6 @@ class Sega_wo_p_MemTransformerLM(nn.Module):
             return [loss]
         else:
             return [loss] + new_mems
-
 
 class Sega_wo_s_MemTransformerLM(nn.Module):
     def __init__(self, n_token, n_layer, n_head, d_model, d_head, d_inner,

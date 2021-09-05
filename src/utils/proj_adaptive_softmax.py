@@ -325,7 +325,6 @@ class ProjectedAdaptiveLogSoftmax(nn.Module):
         all_probs = all_probs.cpu()
         return all_probs
 
-
 class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
     def __init__(
         self,
@@ -358,67 +357,50 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
         self.n_clusters = len(self.cutoffs) - 1
         self.head_size = self.shortlist_size + self.n_clusters
 
+        # self.remove_root = []
+        # self.remove_leaf = []
+        # self.remove_root_and_leaf = []
         if self.n_clusters > 0:
             self.cluster_weight = nn.Parameter(
                 torch.zeros(self.n_clusters, self.d_embed)
             )
             self.cluster_bias = nn.Parameter(torch.zeros(self.n_clusters))
-            self.cl_cutoffs_root_index = []
-            self.cl_cutoffs_leaf_index = []
             for i in range(len(self.cutoffs)):
                 l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
-                self.cl_cutoffs_root_index.append(
-                    [
-                        index - l_idx
+                cur_length = r_idx-l_idx
+                if i == 0:
+                    cur_length+=(len(self.cutoffs)-1)
+                root_index = [index - l_idx
                         for index in self.cl_all_root_index
-                        if index < r_idx and index >= l_idx
-                    ]
-                )
-                self.cl_cutoffs_leaf_index.append(
-                    [
+                        if index < r_idx and index >= l_idx]
+
+                leaf_index = [
                         index - l_idx
                         for index in self.cl_all_leaf_index
                         if index < r_idx and index >= l_idx
                     ]
-                )
+                self.register_buffer('remove_root_{}'.format(i), torch.zeros(cur_length).index_fill_(0, torch.tensor(root_index),float("inf")))
+                self.register_buffer('remove_leaf_{}'.format(i), torch.zeros(cur_length).index_fill_(0, torch.tensor(leaf_index),float("inf")))
+                self.register_buffer('remove_root_and_leaf_{}'.format(i), torch.zeros(cur_length).index_fill_(0, torch.tensor(root_index+leaf_index),float("inf")))
+        else:
+            self.register_buffer('remove_root_{}'.format(i), torch.zeros(n_token).index_fill_(0, torch.tensor(cl_all_root_index),float("inf")))
+            self.register_buffer('remove_leaf_{}'.format(i), torch.zeros(n_token).index_fill_(0, torch.tensor(cl_all_leaf_index),float("inf")))
+            self.register_buffer('remove_root_and_leaf_{}'.format(i), torch.zeros(n_token).index_fill_(0, torch.tensor(cl_all_root_index+cl_all_leaf_index),float("inf")))
 
         self.out_layers = nn.ModuleList()
-        self.out_projs = nn.ParameterList()
-
+        self.proj_flag = False
         if div_val == 1:
-            for i in range(len(self.cutoffs)):
-                if d_proj != d_embed:
-                    self.out_projs.append(nn.Parameter(torch.Tensor(d_proj, d_embed)))
-                else:
-                    self.out_projs.append(None)
-            # if self.learn_offset:
-            #     n_token = n_token-len(cl_all_root_index)
-            #     self.n_token = n_token
-            #     self.out_layers.append(nn.Linear(d_embed, n_token))
-            #     self.hypernym_emb = nn.Linear(
-            #         d_embed, len(cl_all_root_index)+1)
-            #     hypernym_list = []
-            #     for i in range(n_token):
-            #         if i in word2class.keys():
-            #             hypernym_list.append(word2class[i]+1-n_token)
-            #         else:
-            #             hypernym_list.append(0)
-            #     # for i in range(n_token):
-            #     #     if i in word2class:
-            #     #         hypernym_list.append(word2class[i])
-            #     #     else:
-            #     #         hypernym_list.append(0)
-            #     self.hypernym_list = hypernym_list
-            # else:
-            self.out_layers.append(nn.Linear(d_embed, n_token))
+            if d_proj != d_embed:
+                self.proj_flag=True
+                self.out_layers.append(nn.Sequential(nn.Linear(d_proj, d_embed,  bias=False),nn.Linear(d_embed, n_token)))
+            else:
+                self.out_layers.append(nn.Sequential(nn.Linear(d_embed, n_token)))
         else:
+            self.proj_flag=True
             for i in range(len(self.cutoffs)):
                 l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
                 d_emb_i = d_embed // (div_val ** i)
-
-                self.out_projs.append(nn.Parameter(torch.Tensor(d_proj, d_emb_i)))
-
-                self.out_layers.append(nn.Linear(d_emb_i, r_idx - l_idx))
+                self.out_layers.append(nn.Sequential(nn.Linear(d_proj, d_emb_i, bias=False),nn.Linear(d_emb_i, r_idx - l_idx)))
 
         self.keep_order = keep_order
 
@@ -455,90 +437,52 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
             raise RuntimeError(
                 "Input and target should have the same size " "in the batch dimension."
             )
-        # if self.learn_offset:
-        #     if type(self.hypernym_list) is not torch.Tensor:
-        #         self.hypernym_list = torch.tensor(
-        #             self.hypernym_list, device=hidden.device)
-        #     hypernym_list_weight = self.hypernym_emb.weight[self.hypernym_list]
-        #     self.out_layer_for_offset_weight = torch.cat(
-        #         [self.out_layers[0].weight+hypernym_list_weight, self.hypernym_emb.weight[1:]])
-        #     self.out_layer_for_offset_bias = torch.cat(
-        #         [self.out_layers[0].bias, self.hypernym_emb.bias[1:]])
         if self.n_clusters == 0:
-            # if self.learn_offset:
-            #     logit = self._compute_logit(hidden, self.out_layer_for_offset_weight.weight,
-            #                                 self.out_layer_for_offset_bias, self.out_projs[0])
-            # else:
-            logit = self._compute_logit(
-                hidden,
-                self.out_layers[0].weight,
-                self.out_layers[0].bias,
-                self.out_projs[0],
-            )
+            logit = self.out_layers[0](hidden)
             if predict_root:
-                logit[:, self.cl_all_leaf_index] = -float("inf")
+                logit = logit - getattr(self, 'remove_leaf_{}'.format(0))
             else:
-                logit[:, self.cl_all_root_index] = -float("inf")
+                logit = logit - getattr(self, 'remove_root_{}'.format(0))
             if general_words_only:
-                logit[:, self.cl_all_leaf_index + self.cl_all_root_index] = -float(
-                    "inf"
-                )
+                logit = logit - getattr(self, 'remove_root_and_leaf_{}'.format(0))
 
             nll = (
                 -F.log_softmax(logit, dim=-1).gather(1, target.unsqueeze(1)).squeeze(1)
             )
         else:
             # construct weights and biases
-            weights, biases = [], []
+            weights, biases, projs = [], [], []
             for i in range(len(self.cutoffs)):
                 if self.div_val == 1:
                     l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
-                    # if self.learn_offset:
-                    #     weight_i = self.out_layer_for_offset_weight[l_idx:r_idx]
-                    #     bias_i = self.out_layer_for_offset_bias[l_idx:r_idx]
-                    # else:
-                    weight_i = self.out_layers[0].weight[l_idx:r_idx]
-                    bias_i = self.out_layers[0].bias[l_idx:r_idx]
+                    weight_i = self.out_layers[0][-1].weight[l_idx:r_idx]
+                    bias_i = self.out_layers[0][-1].bias[l_idx:r_idx]
+                    if self.proj_flag:
+                        projs_i = self.out_layers[0][0].weight
+                    else:
+                        projs_i = None
                 else:
-                    weight_i = self.out_layers[i].weight
-                    bias_i = self.out_layers[i].bias
-
+                    weight_i = self.out_layers[i][-1].weight
+                    bias_i = self.out_layers[i][-1].bias
+                    projs_i = self.out_layers[i][0].weight
                 if i == 0:
                     weight_i = torch.cat([weight_i, self.cluster_weight], dim=0)
                     bias_i = torch.cat([bias_i, self.cluster_bias], dim=0)
 
                 weights.append(weight_i)
                 biases.append(bias_i)
+                projs.append(projs_i)
 
-            head_weight, head_bias, head_proj = weights[0], biases[0], self.out_projs[0]
-            head_leaf_index, head_root_index = (
-                self.cl_cutoffs_leaf_index[0],
-                self.cl_cutoffs_root_index[0],
-            )
+            head_weight, head_bias, head_proj = weights[0], biases[0], projs[0]
+
             head_logit = self._compute_logit(hidden, head_weight, head_bias, head_proj)
             if predict_root:
-                if head_leaf_index:
-                    head_logit.index_fill_(
-                        1,
-                        torch.tensor(head_leaf_index, device=head_logit.device),
-                        float("-inf"),
-                    )
+                head_logit = head_logit-getattr(self, 'remove_leaf_{}'.format(0))
             else:
-                if head_root_index:
-                    head_logit.index_fill_(
-                        1,
-                        torch.tensor(head_root_index, device=head_logit.device),
-                        float("-inf"),
-                    )
+                head_logit = head_logit-getattr(self, 'remove_root_{}'.format(0))
+
             if general_words_only:
-                if head_leaf_index + head_root_index:
-                    head_logit.index_fill_(
-                        1,
-                        torch.tensor(
-                            head_leaf_index + head_root_index, device=head_logit.device
-                        ),
-                        float("-inf"),
-                    )
+                head_logit = head_logit-getattr(self, 'remove_root_and_leaf_{}'.format(0))
             # head_logit[:,0] = -float('inf')
             head_logprob = F.log_softmax(head_logit, dim=1)
 
@@ -561,40 +505,18 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                 if i == 0:
                     logprob_i = head_logprob_i.gather(1, target_i[:, None]).squeeze(1)
                 else:
-                    weight_i, bias_i, proj_i = weights[i], biases[i], self.out_projs[i]
-                    leaf_index_i, root_index_i = (
-                        self.cl_cutoffs_leaf_index[i],
-                        self.cl_cutoffs_root_index[i],
-                    )
+                    weight_i, bias_i, proj_i = weights[i], biases[i], projs[i]
                     hidden_i = hidden.index_select(0, indices_i)
 
                     tail_logit_i = self._compute_logit(
                         hidden_i, weight_i, bias_i, proj_i
                     )
                     if predict_root:
-                        if leaf_index_i:
-                            tail_logit_i.index_fill_(
-                                1,
-                                torch.tensor(leaf_index_i, device=head_logit.device),
-                                float("-inf"),
-                            )
+                        tail_logit_i -= getattr(self, 'remove_leaf_{}'.format(i))
                     else:
-                        if root_index_i:
-                            tail_logit_i.index_fill_(
-                                1,
-                                torch.tensor(root_index_i, device=head_logit.device),
-                                float("-inf"),
-                            )
+                        tail_logit_i -= getattr(self, 'remove_root_{}'.format(i))
                     if general_words_only:
-                        if leaf_index_i + root_index_i:
-                            tail_logit_i.index_fill_(
-                                1,
-                                torch.tensor(
-                                    leaf_index_i + root_index_i,
-                                    device=head_logit.device,
-                                ),
-                                float("-inf"),
-                            )
+                        tail_logit_i -= getattr(self, 'remove_root_and_leaf_{}'.format(i))
                     tail_logprob_i = F.log_softmax(tail_logit_i, dim=1)
 
                     logprob_i = head_logprob_i[:, -i] + tail_logprob_i.gather(
@@ -629,20 +551,13 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                 "Input and target should have the same size " "in the batch dimension."
             )
         if self.n_clusters == 0:
-            logit = self._compute_logit(
-                hidden,
-                self.out_layers[0].weight,
-                self.out_layers[0].bias,
-                self.out_projs[0],
-            )
+            logit = self.out_layers[0](hidden)
             if predict_root:
-                logit[:, self.cl_all_leaf_index] = -float("inf")
+                logit = logit - getattr(self, 'remove_leaf_{}'.format(0))
             else:
-                logit[:, self.cl_all_root_index] = -float("inf")
+                logit = logit - getattr(self, 'remove_root_{}'.format(0))
             if general_words_only:
-                logit[:, self.cl_all_leaf_index + self.cl_all_root_index] = -float(
-                    "inf"
-                )
+                logit = logit - getattr(self, 'remove_root_and_leaf_{}'.format(0))
 
             all_probs = F.softmax(logit, dim=-1)
             if top_k==-1:
@@ -650,39 +565,32 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
             probs, words = torch.topk(all_probs, k=top_k, dim=-1)
         else:
             # construct weights and biases
-            weights, biases = [], []
+            weights, biases, projs = [], [], []
             for i in range(len(self.cutoffs)):
                 if self.div_val == 1:
                     l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
-                    # if self.learn_offset:
-                    #     weight_i = self.out_layer_for_offset_weight[l_idx:r_idx]
-                    #     bias_i = self.out_layer_for_offset_bias[l_idx:r_idx]
-                    # else:
-                    weight_i = self.out_layers[0].weight[l_idx:r_idx]
-                    bias_i = self.out_layers[0].bias[l_idx:r_idx]
+                    weight_i = self.out_layers[0][-1].weight[l_idx:r_idx]
+                    bias_i = self.out_layers[0][-1].bias[l_idx:r_idx]
+                    if self.proj_flag:
+                        projs_i = self.out_layers[0][0].weight
+                    else:
+                        projs_i = None
                 else:
-                    weight_i = self.out_layers[i].weight
-                    bias_i = self.out_layers[i].bias
-
+                    weight_i = self.out_layers[i][-1].weight
+                    bias_i = self.out_layers[i][-1].bias
+                    projs_i = self.out_layers[i][0].weight
                 if i == 0:
                     weight_i = torch.cat([weight_i, self.cluster_weight], dim=0)
                     bias_i = torch.cat([bias_i, self.cluster_bias], dim=0)
 
                 weights.append(weight_i)
                 biases.append(bias_i)
+                projs.append(projs_i)
 
-            head_weight, head_bias, head_proj = weights[0], biases[0], self.out_projs[0]
-            head_leaf_index, head_root_index = (
-                self.cl_cutoffs_leaf_index[0],
-                self.cl_cutoffs_root_index[0],
-            )
+            head_weight, head_bias, head_proj = weights[0], biases[0], projs[0]
+
             head_logit = self._compute_logit(hidden, head_weight, head_bias, head_proj)
-            if head_root_index:
-                head_logit.index_fill_(
-                    1,
-                    torch.tensor(head_root_index, device=head_logit.device),
-                    float("-inf"),
-                )
+            head_logit = head_logit-getattr(self, 'remove_leaf_{}'.format(0))
             head_logprob = F.log_softmax(head_logit, dim=1)
             words = torch.zeros(
                 size=(hidden.size()[0], self.n_token),
@@ -700,18 +608,9 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                 if i == 0:
                     probs[:,l_idx:r_idx] = head_logprob[:,l_idx:r_idx]
                 else:
-                    weight_i, bias_i, proj_i = weights[i], biases[i], self.out_projs[i]
-                    leaf_index_i, root_index_i = (
-                        self.cl_cutoffs_leaf_index[i],
-                        self.cl_cutoffs_root_index[i],
-                    )
+                    weight_i, bias_i, proj_i = weights[i], biases[i], projs[i]
                     tail_logit_i = self._compute_logit(hidden, weight_i, bias_i, proj_i)
-                    if root_index_i:
-                        tail_logit_i.index_fill_(
-                            1,
-                            torch.tensor(root_index_i, device=head_logit.device),
-                            float("-inf"),
-                        )
+                    tail_logit_i -= getattr(self, 'remove_root_{}'.format(i))
 
                     tail_logprob_i = F.log_softmax(tail_logit_i, dim=1)
 

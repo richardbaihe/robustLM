@@ -17,39 +17,13 @@ import mpu
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from fp16 import FP16_Module
-from fp16 import FP16_Optimizer
-# from torch.cuda.amp import autocast
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-from apex.parallel import DistributedDataParallel as apexDDP
-from apex.optimizers import FusedAdam as Adam
 from apex import amp, optimizers
 from utils.arguments import get_args
 from data_utils import MixCorpus
 from utils.exp_utils import create_exp_dir, \
-    print_rank_0, save_checkpoint, load_checkpoint, get_params_for_weight_decay_optimization
+    print_rank_0, save_checkpoint, load_checkpoint, get_params_for_weight_decay_optimization, Timers
 from mem_transformer import MemTransformerLM, SegaMemTransformerLM
-
-torch.autograd.set_detect_anomaly(True)
-def initialize_distributed(args):
-    """Initialize torch.distributed."""
-
-    # Manually set the device ids.
-    device = args.rank % torch.cuda.device_count()
-    if args.local_rank is not None:
-        device = args.local_rank
-    torch.cuda.set_device(device)
-    # Call the init process
-    init_method = 'tcp://'
-    master_ip = os.getenv('MASTER_ADDR', 'localhost')
-    master_port = os.getenv('MASTER_PORT', '6000')
-    init_method += master_ip + ':' + master_port
-    torch.distributed.init_process_group(
-        backend=args.distributed_backend,
-        world_size=args.world_size, rank=args.rank,
-        init_method=init_method)
-    # # Set the model-parallel / data-parallel communicators.
-    # mpu.initialize_model_parallel(args.model_parallel_size)
+from utils.data_parallel import BalancedDataParallel
 
 def wandb_init(args):
     wandb_config = json.load(open('wandb_config.json','r'))
@@ -67,7 +41,6 @@ def set_random_seed(seed):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        # mpu.model_parallel_cuda_manual_seed(seed)
 
 def get_lm_corpus(args):
     corpus = None
@@ -82,21 +55,27 @@ def get_lm_corpus(args):
         print('Loading cached dataset...')
         corpus = torch.load(fn)
     else:
-        print('Producing dataset {} with rank {}'.format(args.dataset, args.rank))
+        print('Producing dataset {} '.format(args.dataset))
         corpus = MixCorpus(args, **kwargs)
         torch.save(corpus, fn)
+    if args.mix_vocab:
+        args.cl_all_root_index = corpus.vocab.cl_root_tokens
+        args.cl_all_leaf_index = corpus.vocab.cl_leaf_tokens
+        word2class_id = {}
+        for k,v in corpus.vocab.word2class.items():
+            word2class_id[corpus.vocab.sym2idx[k]] = corpus.vocab.sym2idx[v]
+        args.cl_root_leaf_dict = corpus.vocab.class2words
+        args.word2class_id = word2class_id if args.learn_offset else None
+    else:
+        args.cl_all_root_index=None
+        args.cl_all_leaf_index=None
+        args.cl_root_leaf_dict=None
+        args.word2class_id=None
     #torch.save(corpus, fn)
     ntokens = torch.cuda.LongTensor([len(corpus.vocab)])
     # cl_root_tokens = torch.cuda.LongTensor(corpus.vocab.cl_root_tokens)
     # cl_leaf_tokens = torch.cuda.LongTensor(corpus.vocab.cl_leaf_tokens)
     args.n_token = ntokens.item()
-    args.cl_all_root_index = corpus.vocab.cl_root_tokens
-    args.cl_all_leaf_index = corpus.vocab.cl_leaf_tokens
-    word2class_id = {}
-    for k,v in corpus.vocab.word2class.items():
-        word2class_id[corpus.vocab.sym2idx[k]] = corpus.vocab.sym2idx[v]
-    args.cl_root_leaf_dict = corpus.vocab.class2words
-    args.word2class_id = word2class_id if args.learn_offset else None
     return corpus
 
 def get_model(args):
@@ -129,10 +108,9 @@ def get_model(args):
             if hasattr(m, 'bias') and m.bias is not None:
                 init_bias(m.bias)
         elif classname.find('AdaptiveEmbedding') != -1:
-            if hasattr(m, 'emb_projs'):
-                for i in range(len(m.emb_projs)):
-                    if m.emb_projs[i] is not None:
-                        nn.init.normal_(m.emb_projs[i], 0.0, args.proj_init_std)
+            if hasattr(m, 'emb_proj_flag') and m.emb_proj_flag:
+                for i in range(len(m.emb_layers)):
+                    nn.init.normal_(m.emb_layers[i][-1].weight, 0.0, args.proj_init_std)
         elif classname.find('Embedding') != -1:
             if hasattr(m, 'weight'):
                 init_weight(m.weight)
@@ -145,6 +123,14 @@ def get_model(args):
                 for i in range(len(m.out_projs)):
                     if m.out_projs[i] is not None:
                         nn.init.normal_(m.out_projs[i], 0.0, args.proj_init_std)
+        elif classname.find('ClassedProjectedAdaptiveLogSoftmax')!=-1:
+            if hasattr(m, 'cluster_weight') and m.cluster_weight is not None:
+                init_weight(m.cluster_weight)
+            if hasattr(m, 'cluster_bias') and m.cluster_bias is not None:
+                init_bias(m.cluster_bias)
+            if hasattr(m, 'proj_flag') and m.proj_flag:
+                for i in range(len(m.out_layers)):
+                    nn.init.normal_(m.out_layers[i][0].weight, 0.0, args.proj_init_std)
         elif classname.find('LayerNorm') != -1:
             if hasattr(m, 'weight'):
                 nn.init.normal_(m.weight, 1.0, args.init_std)
@@ -206,9 +192,7 @@ def get_model(args):
     return model
 
 def get_optimizer(model, args):
-    while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
-        model = model.module
-    
+   
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     return optimizer
@@ -235,6 +219,17 @@ def get_learning_rate_scheduler(optimizer, args):
     return scheduler
 
 def setup_model_and_optimizer(args):
+    device = torch.device('cuda' if args.cuda else 'cpu')
+    # if args.fp16:
+    #     if not args.cuda:
+    #         print('WARNING: --fp16 requires --cuda, ignoring --fp16 option')
+    #         args.fp16 = False
+    #     else:
+    #         try:
+    #             from apex.fp16_utils import FP16_Optimizer
+    #         except:
+    #             print('WARNING: apex not installed, ignoring --fp16 option')
+    #             args.fp16 = False
     #### get model
     model = get_model(args)
     #### optimizer
@@ -244,13 +239,18 @@ def setup_model_and_optimizer(args):
     args.iteration = 0
     if args.load_lastest:
         args.iteration = load_checkpoint(model, optimizer, scheduler, args, best=False)
-    
     if args.fp16:
-        model, optimizer = amp.initialize(model, optimizer,
-                                      opt_level="O2",
-                                      loss_scale='dynamic'
-                                      )
-    model = apexDDP(model)
+        model, optimizer = amp.initialize(torch.nn.Sequential(model), optimizer,
+                                    opt_level="O2",
+                                    loss_scale='dynamic')
+        model = model[0]
+    if args.gpu0_bsz >= 0:
+        model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk,
+                                        model, dim=1).to(device)
+    else:
+        model = nn.DataParallel(model, dim=1).to(device)
+    if args.fp16:
+        model.forward = lambda *args, old_fwd = model.forward, input_caster = lambda tensor: tensor, output_caster = lambda tensor: tensor.to(amp._amp_state.opt_properties.options['cast_model_outputs'] if amp._amp_state.opt_properties.options.get('cast_model_outputs') is not None else torch.float32), **kwargs: amp._initialize.applier(old_fwd(*amp._initialize.applier(args, input_caster), **amp._initialize.applier(kwargs, input_caster)), output_caster)
     scaler = None
     # scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
     # model = torchDDP(model, device_ids=[args.rank])
@@ -263,13 +263,6 @@ def get_batch(data_iterator, iteration):
     cl_input_data = data['cl_input']
     cl_target = data['cl_target']
     return input_data, target, cl_input_data, cl_target
-
-def get_reduced_loss(loss, world_size):
-    reduced_losses = loss.view(1)
-    torch.distributed.all_reduce(reduced_losses.data)
-    reduced_losses.data = reduced_losses.data / world_size
-    loss_reduced = reduced_losses[0]
-    return loss_reduced
 
 def pacing_function(current_step, nbatch_per_epoch, training, args):
 
@@ -338,30 +331,33 @@ def backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args):
         loss = lm_loss
     optimizer.zero_grad()
 
-    # scaler.scale(loss).backward()
-    # scaler.unscale_(optimizer)
-    # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-
-    # scaler.step(optimizer)
-    # scaler.update()
     if args.fp16:
         with amp.scale_loss(loss, optimizer) as scaled_loss:
             scaled_loss.backward()
     else:
         loss.backward()
-    
-    lm_loss_reduced = get_reduced_loss(lm_loss, args.world_size)
-    auxiliary_loss_reduced = get_reduced_loss(auxiliary_loss, args.world_size)
 
     if args.fp16:
         torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
     else:
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
 
-    return lm_loss_reduced, auxiliary_loss_reduced
+    # if args.fp16:
+    #     optimizer.backward(loss)
+    # else:
+    #     loss.backward()
+    # if args.fp16:
+    #     optimizer.clip_master_grads(args.clip)
+    # else:
+    #     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+
+    return lm_loss, auxiliary_loss
 
 def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args):
     lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
+    if args.loss_length_scale and iteration<(args.max_step//3):
+        scale_vec = torch.exp(torch.range(-(lm_loss.shape[0]+1)//2,(lm_loss.shape[0]+1)/2)*0.001)[:lm_loss.shape[0]].to(lm_loss.device)
+        lm_loss = (lm_loss.t()* scale_vec).t()
     lm_loss = lm_loss.mean().type_as(lm_loss)
     auxiliary_loss = auxiliary_loss.mean().type_as(auxiliary_loss)
 
@@ -376,10 +372,7 @@ def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iter
     cl_loss = cl_loss.float().mean().type_as(cl_loss)
     non_cl_loss = non_cl_loss.float().mean().type_as(non_cl_loss)
 
-    cl_lm_loss_reduced = get_reduced_loss(cl_loss,args.world_size)
-    non_cl_lm_loss_reduced = get_reduced_loss(non_cl_loss,args.world_size)
-
-    return lm_loss_reduced, auxiliary_loss_reduced, cl_lm_loss_reduced, non_cl_lm_loss_reduced, new_mems
+    return lm_loss_reduced, auxiliary_loss_reduced, cl_loss, non_cl_loss, new_mems
 
 def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, val_data_iterator, args):
     # Turn on training mode which enables dropout.
@@ -415,21 +408,21 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
                 corpus.rebuild_data_with_wn_layer_n(wn_layer)
                 device = torch.device('cuda' if args.cuda else 'cpu')
                 tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len,
-                                            device=device, ext_len=args.ext_len, rank=args.rank, world_size=args.world_size)
+                                            device=device, ext_len=args.ext_len)
                 va_iter = corpus.get_iterator('valid', args.eval_batch_size, args.eval_tgt_len,
-                                            device=device, ext_len=args.ext_len, rank=0, world_size=1)
+                                            device=device, ext_len=args.ext_len)
 
         if args.cl_batch_size>0:
             if iteration < cl_steps*2 and not cl_batch_size:
                 device = torch.device('cuda' if args.cuda else 'cpu')
                 train_data_iterator = corpus.get_iterator('train', args.cl_batch_size, args.tgt_len,
-                                            device=device, ext_len=args.ext_len, rank=args.rank, world_size=args.world_size)
+                                            device=device, ext_len=args.ext_len)
                 cl_batch_size = True
             elif iteration>=cl_steps*2 and cl_batch_size:
                 cl_batch_size=False
                 device = torch.device('cuda' if args.cuda else 'cpu')
                 train_data_iterator = corpus.get_iterator('train', args.batch_size, args.tgt_len,
-                            device=device, ext_len=args.ext_len, rank=args.rank, world_size=args.world_size)
+                            device=device, ext_len=args.ext_len)
         # if hypernym_grad and args.learn_offset and iteration>args.cl_steps:
         #     model.module.change()
         #     hypernym_grad = False
@@ -445,25 +438,25 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
         total_non_cl_lm_loss += current_non_cl_lm_loss
         # logging
         learning_rate = optimizer.param_groups[0]['lr']
-        if args.rank == 0:
-            log_dict = {"train/lr": learning_rate, "train/lm_loss": current_lm_loss, 
-            "train/cl_lm_loss": current_cl_lm_loss, "train/non_cl_lm_loss": current_non_cl_lm_loss, 
-            "train/auxiliary_loss":current_auxiliary_loss}
-            wandb.log(log_dict,step=iteration)
+
+        log_dict = {"train/lr": learning_rate, "train/lm_loss": current_lm_loss, 
+        "train/cl_lm_loss": current_cl_lm_loss, "train/non_cl_lm_loss": current_non_cl_lm_loss, 
+        "train/auxiliary_loss":current_auxiliary_loss}
+        wandb.log(log_dict,step=iteration)
         if iteration % args.log_interval == 0:
             elapsed = time.time() - log_start_time
             avg_lm_loss = total_lm_loss / args.log_interval
             avg_cl_lm_loss = total_cl_lm_loss / args.log_interval
             avg_non_cl_lm_loss = total_non_cl_lm_loss / args.log_interval
             avg_auxiliary_loss = total_auxiliary_loss / args.log_interval
-            if args.rank == 0:
-                epoch = iteration//train_data_iterator.n_batch
-                log_str = '| epoch {:3d} step {:>8d} | ms/batch {:5.2f} |  lr {:.3g} | loss {:5.2f}'.format(
-                    epoch, iteration, elapsed*1000/args.log_interval, learning_rate, avg_lm_loss)
-                log_start_time = time.time()
-                print_rank_0(log_str)
-                wandb.log({"train_avg/lm_loss": avg_lm_loss, "train_avg/cl_lm_loss":avg_cl_lm_loss,
-                "train_avg/non_cl_lm_loss":avg_non_cl_lm_loss, "train_avg/auxiliary_loss":avg_auxiliary_loss}, step=iteration)
+
+            epoch = iteration//train_data_iterator.n_batch
+            log_str = '| epoch {:3d} step {:>8d} | ms/batch {:5.2f} |  lr {:.3g} | loss {:5.2f}'.format(
+                epoch, iteration, elapsed*1000/args.log_interval, learning_rate, avg_lm_loss)
+            log_start_time = time.time()
+            print(log_str)
+            wandb.log({"train_avg/lm_loss": avg_lm_loss, "train_avg/cl_lm_loss":avg_cl_lm_loss,
+            "train_avg/non_cl_lm_loss":avg_non_cl_lm_loss, "train_avg/auxiliary_loss":avg_auxiliary_loss}, step=iteration)
             total_lm_loss = 0
             total_cl_lm_loss = 0
             total_non_cl_lm_loss = 0
@@ -472,19 +465,17 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
             save_checkpoint(iteration, model, None, None, args, best=False)
         if iteration % args.eval_interval == 0:
             val_lm_ppl = None
-            if args.rank == 0:
-                val_lm_ppl = evaluate_and_print_results(val_data_iterator, model,args, iteration)
-                if val_lm_ppl < best_val_ppl:
-                    save_checkpoint(iteration, model, None, None, args, best=True)
-                    best_val_ppl = val_lm_ppl
-            torch.distributed.barrier()
+            val_lm_ppl = evaluate_and_print_results(val_data_iterator, model,args, iteration)
+            if val_lm_ppl < best_val_ppl:
+                save_checkpoint(iteration, model, None, None, args, best=True)
+                best_val_ppl = val_lm_ppl
 
     return iteration
 
 def evaluate(data_iterator, model, args):
     # If the model does not use memory at all, make the ext_len longer.
     # Otherwise, make the mem_len longer and keep the ext_len the same.
-    while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
+    while isinstance(model, (nn.DataParallel)):
         model = model.module
     model.eval()
     if args.mem_len == 0:
@@ -531,12 +522,11 @@ def evaluate_and_print_results(data_iterator, model, args, iteration):
     eval_start_time = time.time()
     lm_loss, auxiliary_loss, cl_lm_loss, non_cl_lm_loss = evaluate(data_iterator, model, args)
     val_lm_ppl, val_cl_ppl, val_non_cl_ppl = math.exp(lm_loss), math.exp(cl_lm_loss), math.exp(non_cl_lm_loss)
-    if args.rank == 0:
-        log_str = '| Eval {:3d} at step {:>8d} |  time: {:5.2f}s | valid loss {:5.2f} | auxiliary loss {:5.2f} | valid ppl {:5.2f}'.format(
-                iteration // args.eval_interval, iteration, (time.time() - eval_start_time),
-                 lm_loss, auxiliary_loss, val_lm_ppl)
-        print_rank_0(log_str)
-        wandb.log({"valid/ppl": val_lm_ppl, "valid/cl_ppl": val_cl_ppl, "valid/non_cl_ppl": val_non_cl_ppl, "valid/auxiliary_loss":auxiliary_loss}, step=iteration)
+    log_str = '| Eval {:3d} at step {:>8d} |  time: {:5.2f}s | valid loss {:5.2f} | auxiliary loss {:5.2f} | valid ppl {:5.2f}'.format(
+            iteration // args.eval_interval, iteration, (time.time() - eval_start_time),
+                lm_loss, auxiliary_loss, val_lm_ppl)
+    print(log_str)
+    wandb.log({"valid/ppl": val_lm_ppl, "valid/cl_ppl": val_cl_ppl, "valid/non_cl_ppl": val_non_cl_ppl, "valid/auxiliary_loss":auxiliary_loss}, step=iteration)
     model.train()
     return val_lm_ppl
 
@@ -545,19 +535,16 @@ def test(data_iterator, model, args, iteration):
     eval_start_time = time.time()
     lm_loss, auxiliary_loss, cl_lm_loss, non_cl_lm_loss = evaluate(data_iterator, model, args)
     val_lm_ppl, val_cl_ppl, val_non_cl_ppl = math.exp(lm_loss), math.exp(cl_lm_loss), math.exp(non_cl_lm_loss)
-    if args.rank == 0:
-        log_str = '| Test at step {:>8d} |  time: {:5.2f}s | test loss {:5.2f} | auxiliary loss {:5.2f} | test ppl {:5.2f}'.format(
-                iteration, (time.time() - eval_start_time),
-                 lm_loss, auxiliary_loss, val_lm_ppl)
-        print_rank_0(log_str)
-        wandb.log({"test/ppl": val_lm_ppl, "test/cl_ppl": val_cl_ppl, "test/non_cl_ppl": val_non_cl_ppl, "test/auxiliary_loss":auxiliary_loss})
+    log_str = '| Test at step {:>8d} |  time: {:5.2f}s | test loss {:5.2f} | auxiliary loss {:5.2f} | test ppl {:5.2f}'.format(
+            iteration, (time.time() - eval_start_time),
+                lm_loss, auxiliary_loss, val_lm_ppl)
+    print(log_str)
+    wandb.log({"test/ppl": val_lm_ppl, "test/cl_ppl": val_cl_ppl, "test/non_cl_ppl": val_non_cl_ppl, "test/auxiliary_loss":auxiliary_loss})
     model.train()
     return val_lm_ppl
 
 def get_topk_pred(model, va_iter,top_k=1000):
     model.eval()
-    while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
-        model = model.module
     top_k_pred = defaultdict(list)
     mems=tuple()
     for iteration in tqdm(range(va_iter.n_batch)):
@@ -579,8 +566,8 @@ def get_topk_pred(model, va_iter,top_k=1000):
 def get_gt_rank_and_prob(model, va_iter,cl_all_leaf_sym, class2words, word2class):
 
     model.eval()
-    while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
-        model = model.module
+    # while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
+    #     model = model.module
     #results_rank = defaultdict(list)
     results_prob = defaultdict(list)
     #results_sib_rank = defaultdict(list)
@@ -646,46 +633,37 @@ def get_gt_rank_and_prob(model, va_iter,cl_all_leaf_sym, class2words, word2class
 
 def main():
     args = get_args()
-    initialize_distributed(args)
-    if torch.distributed.get_rank() == 0:
-        wandb_init(args)
-    # writer = SummaryWriter(args.work_dir, flush_secs=30)
 
-    torch.distributed.barrier()
-    # Set the random seed manually for reproducibility.
+    wandb_init(args)
     set_random_seed(args.seed)
     device = torch.device('cuda' if args.cuda else 'cpu')
 
     corpus = get_lm_corpus(args)
-
-    torch.distributed.barrier()
 
     model, optimizer, scheduler, scaler = setup_model_and_optimizer(args)
 
     args.eval_batch_size = 10
     tr_iter, va_iter, te_iter = None, None, None
     tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len,
-        device=device, ext_len=args.ext_len,rank=args.rank, world_size=args.world_size)
+        device=device, ext_len=args.ext_len)
     va_iter = corpus.get_iterator('valid', args.eval_batch_size, args.eval_tgt_len,
-        device=device, ext_len=args.ext_len,rank=0, world_size=1)
+        device=device, ext_len=args.ext_len)
     te_iter = corpus.get_iterator('test', args.eval_batch_size, args.eval_tgt_len,
-        device=device, ext_len=args.ext_len,rank=0, world_size=1)
+        device=device, ext_len=args.ext_len)
 
     if args.do_train:
         train(model, optimizer, scheduler, scaler, corpus, tr_iter, va_iter, args)
     if args.do_eval and args.checkpoint_dir:
         for checkpoint_name in glob.glob(os.path.join(args.checkpoint_dir,'iter_*/model_optim_rng.pt')):
             iteration = load_checkpoint(model, optimizer, scheduler, args, checkpoint_name=checkpoint_name)
-            if args.rank == 0:
-                evaluate_and_print_results(va_iter, model, args, iteration=iteration)
-            torch.distributed.barrier()
+            evaluate_and_print_results(va_iter, model, args, iteration=iteration)
     if args.do_test:
         checkpoint_name = ""
         if args.checkpoint_dir:
             checkpoint_name = os.path.join(args.checkpoint_dir,'best/model_optim_rng.pt')
         iteration = load_checkpoint(model, optimizer, scheduler, args, best=True, checkpoint_name=checkpoint_name)
-        if args.rank == 0:
-            test(te_iter, model, args, iteration=iteration)
+
+        test(te_iter, model, args, iteration=iteration)
 
 if __name__ == "__main__":
     main()

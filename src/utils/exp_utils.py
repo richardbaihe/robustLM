@@ -49,15 +49,15 @@ def get_checkpoint_tracker_filename(checkpoints_path):
 def save_checkpoint(iteration, model, optimizer, lr_scheduler, args, best):
     """Save a model checkpoint."""
     # Only rank zer0 of the data parallel writes to the disk.
-    while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
-        model = model.module
+    # while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
+    #     model = model.module
     # if isinstance(model, torchDDP):
     #     model = model.module
-    if args.rank == 0:
+    if True:
         checkpoint_name = get_checkpoint_name(args.work_dir, iteration, best)
 
-        print('global rank {} is saving checkpoint at iteration {:7d} to {}'.
-              format(torch.distributed.get_rank(), iteration, checkpoint_name))
+        print('saving checkpoint at iteration {:7d} to {}'.
+              format(iteration, checkpoint_name))
 
         sd = {}
         sd['iteration'] = iteration
@@ -78,30 +78,30 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, args, best):
         ensure_directory_exists(checkpoint_name)
         torch.save(sd, checkpoint_name)
         print('  successfully saved {}'.format(checkpoint_name))
-    if not best:
-        # Wait so everyone is done (necessary)
-        torch.distributed.barrier()
+    # if not best:
+    #     # Wait so everyone is done (necessary)
+    #     torch.distributed.barrier()
     # And update the latest iteration
-    if torch.distributed.get_rank() == 0 and not best:
+    if not best:
         tracker_filename = get_checkpoint_tracker_filename(args.work_dir)
         with open(tracker_filename, 'w') as f:
             f.write(str(iteration))
-    if not best:
-        # Wait so everyone is done (not necessary)
-        torch.distributed.barrier()
+    # if not best:
+    #     # Wait so everyone is done (not necessary)
+    #     torch.distributed.barrier()
 
 def load_checkpoint(model, optimizer, lr_scheduler, args, best=False, checkpoint_name=""):
     """Load a model checkpoint."""
-    while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
-        model = model.module
+    # while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
+    #     model = model.module
     iteration = 0
     if not best and not checkpoint_name:
         # Read the tracker file and set the iteration.
         tracker_filename = get_checkpoint_tracker_filename(args.work_dir)
         if not os.path.isfile(tracker_filename):
-            print_rank_0('WARNING: could not find the metadata file {} '.format(
+            print('WARNING: could not find the metadata file {} '.format(
                 tracker_filename))
-            print_rank_0('    will not load any checkpoints and will start from '
+            print('    will not load any checkpoints and will start from '
                         'random')
             return 0
         with open(tracker_filename, 'r') as f:
@@ -112,9 +112,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, args, best=False, checkpoint
     if not checkpoint_name:
         # Checkpoint.
         checkpoint_name = get_checkpoint_name(args.work_dir, iteration, best)
-    if args.rank == 0:
-        print('global rank {} is loading checkpoint {}'.format(
-            torch.distributed.get_rank(), checkpoint_name))
+    print(' is loading checkpoint {}'.format(
+            checkpoint_name))
 
     # Load the checkpoint.
     sd = torch.load(checkpoint_name, map_location='cpu')
@@ -138,9 +137,9 @@ def load_checkpoint(model, optimizer, lr_scheduler, args, best=False, checkpoint
     torch.cuda.set_rng_state(sd['cuda_rng_state'])
 
 
-    torch.distributed.barrier()
-    if args.rank == 0:
-        print('  successfully loaded {}'.format(checkpoint_name))
+    # torch.distributed.barrier()
+    # if args.rank == 0:
+    print('  successfully loaded {}'.format(checkpoint_name))
 
     return iteration
 

@@ -355,6 +355,9 @@ def backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args):
 
 def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args):
     lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
+    if args.loss_length_scale and iteration<(args.max_step//3):
+        scale_vec = torch.exp(torch.range(-(lm_loss.shape[0]+1)//2,(lm_loss.shape[0]+1)/2)*0.001)[:lm_loss.shape[0]].to(lm_loss.device)
+        lm_loss = (lm_loss.t()* scale_vec).t()
     lm_loss = lm_loss.mean().type_as(lm_loss)
     auxiliary_loss = auxiliary_loss.mean().type_as(auxiliary_loss)
 
@@ -472,8 +475,8 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
 def evaluate(data_iterator, model, args):
     # If the model does not use memory at all, make the ext_len longer.
     # Otherwise, make the mem_len longer and keep the ext_len the same.
-    # while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
-    #     model = model.module
+    while isinstance(model, (nn.DataParallel)):
+        model = model.module
     model.eval()
     if args.mem_len == 0:
         model.reset_length(args.eval_tgt_len,

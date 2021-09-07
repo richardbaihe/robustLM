@@ -5,7 +5,6 @@ import torch
 import nltk
 from nltk.corpus import wordnet as wn
 
-
 class Vocab(object):
     def __init__(self, special=[], min_freq=1, max_size=None, lower_case=True,
                  delimiter=None, vocab_file=None):
@@ -360,13 +359,8 @@ class Vocab(object):
 class SegaVocab(Vocab):
     def __init__(self, special=[], min_freq=0, max_size=None, lower_case=True,
                  delimiter=None, vocab_file=None):
-        self.counter = Counter()
-        self.special = special
-        self.min_freq = min_freq
-        self.max_size = max_size
-        self.lower_case = lower_case
-        self.delimiter = delimiter
-        self.vocab_file = vocab_file
+        super().__init__(special, min_freq, max_size, lower_case,
+                 delimiter, vocab_file)
 
     def encode_file(self, path, ordered=False, verbose=False, add_eos=True,
                     add_double_eos=False, add_sent_eos=False, char_level=False):
@@ -419,3 +413,61 @@ class SegaVocab(Vocab):
             t = torch.cat(t)
 
         return (encoded, p, s, t)
+
+    def encode_file_plus(self, path, ordered=False, verbose=False, add_eos=True,
+                    add_double_eos=False, add_sent_eos=False, char_level=False):
+        if verbose:
+            print('encoding file {} ...'.format(path))
+        assert os.path.exists(path)
+        encoded = []
+        encoded_cl = []
+        p = []
+        s = []
+        t = []
+        index_p = 0
+        index_s = 0
+        index_t = 0
+        with open(path, 'r', encoding='utf-8') as f:
+            for idx, line in enumerate(f):
+                if verbose and idx > 0 and idx % 500000 == 0:
+                    print('    line {}'.format(idx))
+                if line.strip() == '':
+                    continue
+                sents = nltk.tokenize.sent_tokenize(line)
+                symbols = []
+                para_pos = []
+                sent_pos = []
+                token_pos = []
+                for i, sent in enumerate(sents):
+                    if i == len(sents)-1:
+                        sent_symbol = self.tokenize(sent, add_eos=add_eos, add_double_eos=add_double_eos,
+                                                    add_sent_eos=add_sent_eos, char_level=char_level)
+                    else:
+                        sent_symbol = self.tokenize(
+                            sent, add_sent_eos=add_sent_eos, char_level=char_level)
+                    symbols.extend(sent_symbol)
+
+                    para_pos.extend([index_p]*len(sent_symbol))
+                    sent_pos.extend([index_s]*len(sent_symbol))
+                    token_pos.extend(range(index_t, index_t+len(sent_symbol)))
+                    index_s += 1
+                    index_t += len(sent_symbol)
+                cl_symbols = [self.word2class[x]
+                              if x in self.word2class else x for x in symbols]
+                index_p += 1
+                # symbols = self.tokenize(line, add_eos=add_eos,
+                #     add_double_eos=add_double_eos)
+                encoded_cl.append(self.convert_to_tensor(cl_symbols))
+                encoded.append(self.convert_to_tensor(symbols))
+                p.append(torch.LongTensor(para_pos))
+                s.append(torch.LongTensor(sent_pos))
+                t.append(torch.LongTensor(token_pos))
+
+        if ordered:
+            encoded = torch.cat(encoded)
+            encoded_cl = torch.cat(encoded_cl)
+            p = torch.cat(p)
+            s = torch.cat(s)
+            t = torch.cat(t)
+
+        return (encoded, p, s, t), encoded_cl

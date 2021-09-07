@@ -50,7 +50,8 @@ def get_lm_corpus(args):
         kwargs['lower_case'] = False
     else:
         raise NotImplementedError
-    fn = os.path.join(args.data, 'cache.pt')
+    fn = os.path.join(args.data, '_'.join(['sega',str(args.sega)[0], 
+    'mix', str(args.mix_vocab)[0], 'cache.pt']) )
     if not args.pt and os.path.exists(fn):
         print('Loading cached dataset...')
         corpus = torch.load(fn)
@@ -171,7 +172,7 @@ def get_model(args):
             tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
             ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
             same_length=args.same_length, attn_type=args.attn_type,
-            clamp_len=args.clamp_len, sample_softmax=args.sample_softmax,sparse_mode=args.sparse_mode)
+            clamp_len=args.clamp_len, sample_softmax=args.sample_softmax,cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index, adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict, word2class_id=args.word2class_id,mix_vocab=args.mix_vocab)
         else:
             model = MemTransformerLM(args.n_token, args.n_layer, args.n_head, args.d_model,
                 args.d_head, args.d_inner, args.dropout, args.dropatt,
@@ -237,11 +238,9 @@ def setup_model_and_optimizer(args):
     #### scheduler
     scheduler = get_learning_rate_scheduler(optimizer, args)
     args.iteration = 0
-    if args.load_lastest:
-        args.iteration = load_checkpoint(model, optimizer, scheduler, args, best=False)
     if args.fp16:
         model, optimizer = amp.initialize(torch.nn.Sequential(model), optimizer,
-                                    opt_level="O2",
+                                    opt_level="O1",
                                     loss_scale='dynamic')
         model = model[0]
     if args.gpu0_bsz >= 0:
@@ -249,8 +248,13 @@ def setup_model_and_optimizer(args):
                                         model, dim=1).to(device)
     else:
         model = nn.DataParallel(model, dim=1).to(device)
-    if args.fp16:
-        model.forward = lambda *args, old_fwd = model.forward, input_caster = lambda tensor: tensor, output_caster = lambda tensor: tensor.to(amp._amp_state.opt_properties.options['cast_model_outputs'] if amp._amp_state.opt_properties.options.get('cast_model_outputs') is not None else torch.float32), **kwargs: amp._initialize.applier(old_fwd(*amp._initialize.applier(args, input_caster), **amp._initialize.applier(kwargs, input_caster)), output_caster)
+    if args.load_checkpoint:
+        if args.load_checkpoint=='best':
+            args.iteration = load_checkpoint(model, optimizer, scheduler, args, best=True)
+        args.iteration = load_checkpoint(model, optimizer, scheduler, args, best=False, 
+        checkpoint_name=args.load_checkpoint)
+    # if args.fp16:
+    #     model.forward = lambda *args, old_fwd = model.forward, input_caster = lambda tensor: tensor, output_caster = lambda tensor: tensor.to(amp._amp_state.opt_properties.options['cast_model_outputs'] if amp._amp_state.opt_properties.options.get('cast_model_outputs') is not None else torch.float32), **kwargs: amp._initialize.applier(old_fwd(*amp._initialize.applier(args, input_caster), **amp._initialize.applier(kwargs, input_caster)), output_caster)
     scaler = None
     # scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
     # model = torchDDP(model, device_ids=[args.rank])
@@ -263,6 +267,15 @@ def get_batch(data_iterator, iteration):
     cl_input_data = data['cl_input']
     cl_target = data['cl_target']
     return input_data, target, cl_input_data, cl_target
+
+def get_batch_sega(data_iterator, iteration):
+    data = data_iterator.get_batch(iteration)
+    input_data = data['input']
+    target = data['target']
+    cl_input_data = data['cl_input']
+    cl_target = data['cl_target']
+    pst = data['pst']
+    return input_data, target, cl_input_data, cl_target, pst
 
 def pacing_function(current_step, nbatch_per_epoch, training, args):
 
@@ -300,29 +313,64 @@ def forward_step(data_iterator, model, mems, iteration, args):
     data, target, cl_data, cl_target = get_batch(data_iterator,iteration)
     root_mask = cl_target!=target
     input_root = args.input_root and class_prediction
-
+    input_data = data
     hypernym_input = cl_data*(cl_data != data) if args.learn_offset else None
     if class_prediction:
         if input_root:
-            ret = model(cl_data, target, cl_target, mems, args, class_prediction=True)
-        else:
-            ret = model(data, target, cl_target, mems, args,
-                        class_prediction=True, hypernym_input=hypernym_input)
-    else:
-        ret = model(data, target, cl_target, mems,
-                    args, hypernym_input=hypernym_input)
-    # ret = model(data, target, cl_data, cl_target, mems, class_prediction, input_root)
+            hypernym_input=None
+            input_data = cl_data
+    ret = model(input_data, target, cl_target, mems, args,
+                        class_prediction=class_prediction, hypernym_input=hypernym_input)
     lm_loss, auxiliary_loss, new_mems = ret[0], ret[1], ret[2:]
     if eval_cl_loss:
+        class_prediction=True
         if args.input_root:
-            ret = model(cl_data, target, cl_target, mems, args, class_prediction=True)
-        else:
-            ret = model(data, target, cl_target, mems, args,
-                        class_prediction=True, hypernym_input=hypernym_input)
+            input_data = cl_data
+            hypernym_input=None
+        ret = model(input_data, target, cl_target, mems, args,
+                        class_prediction=class_prediction, hypernym_input=hypernym_input)
         auxiliary_loss = ret[1]
     cl_loss = lm_loss[root_mask]
     non_cl_loss = lm_loss[~root_mask]
     return lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems
+
+def sega_forward_step(data_iterator, model, mems, iteration, args):
+    mems, mems_pst = mems
+    eval_cl_loss = (args.pacing_unit!='none') and not model.training
+    class_prediction = pacing_function(iteration, data_iterator.n_batch, model.training, args)
+    data, target, cl_data, cl_target, pst = get_batch_sega(data_iterator,iteration)
+    root_mask = cl_target!=target
+    input_root = args.input_root and class_prediction
+    input_data = data
+    hypernym_input = cl_data*(cl_data != data) if args.learn_offset else None
+    if class_prediction:
+        if input_root:
+            hypernym_input=None
+            input_data = cl_data
+    ret = model(input_data, target, cl_target, mems, pst, mems_pst, args,
+                        class_prediction=class_prediction, hypernym_input=hypernym_input)
+    lm_loss, auxiliary_loss, new_mems = ret[0], ret[1], ret[2:]
+    if eval_cl_loss:
+        class_prediction=True
+        if args.input_root:
+            input_data = cl_data
+            hypernym_input=None
+        ret = model(input_data, target, cl_target, mems, pst, mems_pst, args,
+                        class_prediction=class_prediction, hypernym_input=hypernym_input)
+        auxiliary_loss = ret[1]
+    new_pst = []
+    if not mems_pst:
+        mems_pst = pst
+    else:
+        for t, m_t in zip(pst, mems_pst):
+            cat = torch.cat([m_t, t], dim=0)
+            new_pst.append(cat[max(0, len(cat) - args.mem_len):])
+        mems_pst = tuple(new_pst)
+    new_mems = [new_mems, mems_pst]
+    cl_loss = lm_loss[root_mask]
+    non_cl_loss = lm_loss[~root_mask]
+    return lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems
+
 
 def backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args):
     if args.multi_obj:
@@ -354,10 +402,15 @@ def backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args):
     return lm_loss, auxiliary_loss
 
 def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args):
-    lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
+    if args.sega:
+        lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = sega_forward_step(data_iterator, model, mems, iteration, args)
+    else:
+        lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = forward_step(data_iterator, model, mems, iteration, args)
     if args.loss_length_scale and iteration<(args.max_step//3):
         scale_vec = torch.exp(torch.range(-(lm_loss.shape[0]+1)//2,(lm_loss.shape[0]+1)/2)*0.001)[:lm_loss.shape[0]].to(lm_loss.device)
         lm_loss = (lm_loss.t()* scale_vec).t()
+    # if args.fp16:
+    #     lm_loss[lm_loss==0] = torch.finfo(lm_loss.dtype).tiny  
     lm_loss = lm_loss.mean().type_as(lm_loss)
     auxiliary_loss = auxiliary_loss.mean().type_as(auxiliary_loss)
 
@@ -384,6 +437,8 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
     total_auxiliary_loss = 0.0
     best_val_ppl = math.inf
     mems = tuple()
+    if args.sega:
+        mems = [tuple(), tuple()]
     iteration = args.iteration
     log_start_time = time.time()
     hypernym_grad = True
@@ -492,11 +547,16 @@ def evaluate(data_iterator, model, args):
     total_auxiliary_loss = 0
     with torch.no_grad():
         mems = tuple()
+        if args.sega:
+            mems = [tuple(), tuple()]
         for iteration in range(data_iterator.n_batch):
             if args.max_eval_steps > 0 and iteration >= args.max_eval_steps:
                 # total_len = args.max_eval_steps*args.eval_tgt_len
                 break
-            lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = forward_step(data_iterator, model, mems, iteration, args)
+            if args.sega:
+                lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = sega_forward_step(data_iterator, model, mems, iteration, args)
+            else:
+                lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = forward_step(data_iterator, model, mems, iteration, args)
 
             seq_len = lm_loss.size()[0]
             total_lm_len += seq_len

@@ -290,13 +290,13 @@ class MixLMOrderedIterator(LMOrderedIterator):
         self.data = data.view(self.bsz, -1).t().contiguous().to(device)
         data_cl = data_cl.narrow(0, 0, self.n_step*self.bsz)
         self.data_cl = data_cl.view(self.bsz, -1).t().contiguous().to(device)
-        # if self.sega:
-        #     p = p.narrow(0, 0, self.n_step * bsz)
-        #     s = s.narrow(0, 0, self.n_step * bsz)
-        #     t = t.narrow(0, 0, self.n_step * bsz)
-        #     self.p = p.view(bsz, -1).t().contiguous().to(device)
-        #     self.s = s.view(bsz, -1).t().contiguous().to(device)
-        #     self.t = t.view(bsz, -1).t().contiguous().to(device)
+        if self.sega:
+            p = p.narrow(0, 0, self.n_step * bsz)
+            s = s.narrow(0, 0, self.n_step * bsz)
+            t = t.narrow(0, 0, self.n_step * bsz)
+            self.p = p.view(bsz, -1).t().contiguous().to(device)
+            self.s = s.view(bsz, -1).t().contiguous().to(device)
+            self.t = t.view(bsz, -1).t().contiguous().to(device)
         # Number of mini-batches
         self.n_batch = (self.n_step + self.bptt - 1) // self.bptt
 
@@ -314,8 +314,12 @@ class MixLMOrderedIterator(LMOrderedIterator):
 
         cl_data = self.data_cl[beg_idx:end_idx]
         cl_target = self.data_cl[i+1:i+1+seq_len]
+        pst = tuple()
+        if self.sega:
+            pst = (self.p[beg_idx:end_idx],
+                   self.s[beg_idx:end_idx], self.t[beg_idx:end_idx])
 
-        return {'input': data, 'target': target, 'cl_input': cl_data, 'cl_target': cl_target}
+        return {'input': data, 'target': target, 'cl_input': cl_data, 'cl_target': cl_target, 'pst':pst}
 
     def get_fixlen_iter(self, start=0):
         for i in range(start, self.data.size(0) - 1, self.bptt):
@@ -349,7 +353,10 @@ class MixCorpus(object):
     def __init__(self, args, *_args, **kwargs):
         path, dataset, sega, sent_eos = args.data, args.dataset, args.sega, args.sent_eos
         self.dataset = dataset
-        self.vocab = Vocab(*_args, **kwargs)
+        if sega:
+            self.vocab = SegaVocab(*_args, **kwargs)
+        else:
+            self.vocab = Vocab(*_args, **kwargs)
         self.add_sent_eos = sent_eos
         self.path = path
         self.vocab.count_file(os.path.join(

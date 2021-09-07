@@ -116,8 +116,6 @@ def add_training_config_args(parser, is_sagemaker=False):
                             help='use variable length')
         group.add_argument('--same_length', type=boolean_string, default=False,
                             help='use the same attn length for all tokens')
-        group.add_argument('--load_lastest', type=boolean_string, default=False,
-                            help='continue training from lastest checkpoint')  
         group.add_argument('--loss_length_scale', type=boolean_string, default=False,
                             help='scale loss according to the position of tokens')
     else:
@@ -139,10 +137,10 @@ def add_training_config_args(parser, is_sagemaker=False):
                             help='use variable length')
         group.add_argument('--same_length', action='store_true',
                             help='use the same attn length for all tokens')
-        group.add_argument('--load_lastest', action='store_true',
-                            help='continue training from lastest checkpoint')
         group.add_argument('--loss_length_scale', action='store_true', 
-                            help='scale loss according to the position of tokens')    
+                            help='scale loss according to the position of tokens')   
+    group.add_argument('--load_checkpoint', type=str, default="",
+                    help='continue training from lastest checkpoint') 
     group.add_argument('--log_interval', type=int, default=200,
                         help='report interval')
     group.add_argument('--eval_interval', type=int, default=4000,

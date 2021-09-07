@@ -240,7 +240,7 @@ def setup_model_and_optimizer(args):
     args.iteration = 0
     if args.fp16:
         model, optimizer = amp.initialize(torch.nn.Sequential(model), optimizer,
-                                    opt_level="O1",
+                                    opt_level="O2",
                                     loss_scale='dynamic')
         model = model[0]
     if args.gpu0_bsz >= 0:
@@ -253,8 +253,8 @@ def setup_model_and_optimizer(args):
             args.iteration = load_checkpoint(model, optimizer, scheduler, args, best=True)
         args.iteration = load_checkpoint(model, optimizer, scheduler, args, best=False, 
         checkpoint_name=args.load_checkpoint)
-    # if args.fp16:
-    #     model.forward = lambda *args, old_fwd = model.forward, input_caster = lambda tensor: tensor, output_caster = lambda tensor: tensor.to(amp._amp_state.opt_properties.options['cast_model_outputs'] if amp._amp_state.opt_properties.options.get('cast_model_outputs') is not None else torch.float32), **kwargs: amp._initialize.applier(old_fwd(*amp._initialize.applier(args, input_caster), **amp._initialize.applier(kwargs, input_caster)), output_caster)
+    if args.fp16:
+        model.forward = lambda *args, old_fwd = model.forward, input_caster = lambda tensor: tensor, output_caster = lambda tensor: tensor.to(amp._amp_state.opt_properties.options['cast_model_outputs'] if amp._amp_state.opt_properties.options.get('cast_model_outputs') is not None else torch.float32), **kwargs: amp._initialize.applier(old_fwd(*amp._initialize.applier(args, input_caster), **amp._initialize.applier(kwargs, input_caster)), output_caster)
     scaler = None
     # scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
     # model = torchDDP(model, device_ids=[args.rank])
@@ -350,6 +350,8 @@ def sega_forward_step(data_iterator, model, mems, iteration, args):
     ret = model(input_data, target, cl_target, mems, pst, mems_pst, args,
                         class_prediction=class_prediction, hypernym_input=hypernym_input)
     lm_loss, auxiliary_loss, new_mems = ret[0], ret[1], ret[2:]
+    if args.fp16:
+        new_mems = [x.half() for x in new_mems]
     if eval_cl_loss:
         class_prediction=True
         if args.input_root:
@@ -409,8 +411,8 @@ def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iter
     if args.loss_length_scale and iteration<(args.max_step//3):
         scale_vec = torch.exp(torch.range(-(lm_loss.shape[0]+1)//2,(lm_loss.shape[0]+1)/2)*0.001)[:lm_loss.shape[0]].to(lm_loss.device)
         lm_loss = (lm_loss.t()* scale_vec).t()
-    # if args.fp16:
-    #     lm_loss[lm_loss==0] = torch.finfo(lm_loss.dtype).tiny  
+    if args.fp16:
+        lm_loss = lm_loss[lm_loss!=0]
     lm_loss = lm_loss.mean().type_as(lm_loss)
     auxiliary_loss = auxiliary_loss.mean().type_as(auxiliary_loss)
 

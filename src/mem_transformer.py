@@ -277,11 +277,11 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
 
         #### compute attention score
         # qlen x bsz x n_head x d_head
-        rw_head_q = w_head_q + r_w_bias.half()
+        rw_head_q = w_head_q + r_w_bias#.half()
         # qlen x klen x bsz x n_head
         AC = torch.einsum('ibnd,jbnd->ijbn', (rw_head_q, w_head_k))
 
-        rr_head_q = w_head_q + r_r_bias.half()
+        rr_head_q = w_head_q + r_r_bias#.half()
         if sega:
             BD = torch.einsum('ibnd,jbnd->ijbn', (rr_head_q, r_head_k))
         else:
@@ -307,7 +307,7 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
         attn_prob = self.dropatt(attn_prob)
 
         #### compute attention vector
-        attn_vec = torch.einsum('ijbn,jbnd->ibnd', (attn_prob, w_head_v.float()))
+        attn_vec = torch.einsum('ijbn,jbnd->ibnd', (attn_prob, w_head_v)) #.float()
 
         # [qlen x bsz x n_head x d_head]
         attn_vec = attn_vec.contiguous().view(
@@ -514,7 +514,6 @@ class AdaptiveEmbedding(nn.Module):
                     nn.Linear(d_emb_i, d_proj, bias=False)
                     ))
         self.register_buffer("_float_tensor", torch.FloatTensor(1))
-        self.fp16=True
         # self.register_buffer("_half_tensor", torch.HalfTensor(1))
 
     def forward(self, inp):
@@ -523,8 +522,8 @@ class AdaptiveEmbedding(nn.Module):
         else:
             inp_flat = inp.reshape(-1)
             emb_flat = self._float_tensor.new(inp_flat.shape + (self.d_proj,))
-            if self.fp16:
-                emb_flat = emb_flat.half()
+            # if self.fp16:
+            #     emb_flat = emb_flat.half()
 
             for i in range(len(self.cutoffs)):
                 mask = inp_flat.lt(self.cutoffs[i])

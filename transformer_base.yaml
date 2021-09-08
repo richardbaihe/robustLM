@@ -22,43 +22,13 @@ data:
   remote_dir: data/wikitext-103
 
 # list of jobs to run, we run 2 jobs in this example
+# For large model, the minimum GPU configuration is a 8*32GB single node.
 jobs:
-- name: train_large_baseline
-  sku: G4
+- name: train_large_segaxl_hp
+  sku: G8
   command:
-  - python -m torch.distributed.launch 
-    --nproc_per_node 8 
-    --nnodes 1 
-    --node_rank 0 
-    --master_addr 127.0.0.1 
-    --master_port 16010
-    train.py 
-    --job_name train_large_baseline
-    --max_step 500000
-    --batch_size 16
-    --model_size large
-    --mix_vocab
-    --dataset wt103
-    --adaptive
-    --fp16
-    --dynamic-loss-scale
-    --multi_gpu
-    --cuda
-    --pt
-    --do_train
-    --do_test
-
-- name: train_large_hp
-  sku: G4
-  command:
-  - python -m torch.distributed.launch 
-    --nproc_per_node 8 
-    --nnodes 1 
-    --node_rank 0 
-    --master_addr 127.0.0.1 
-    --master_port 16010
-    train.py 
-    --job_name train_large_hp
+  - python train.py 
+    --job_name train_large_segaxl_hp
     --pacing_function step
     --pacing_unit step
     --a 0.12
@@ -66,8 +36,12 @@ jobs:
     --wn_layer 5
     --mix_vocab
     --input_root
-    --max_step 500000
-    --batch_size 16
+    --max_step 400000
+    --batch_size 128
+    --gpu0_bsz 8
+    --mem_len 384
+    --sega
+    --init_std 0.01
     --model_size large
     --dataset wt103
     --adaptive

@@ -356,7 +356,7 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
         self.shortlist_size = self.cutoffs[0]
         self.n_clusters = len(self.cutoffs) - 1
         self.head_size = self.shortlist_size + self.n_clusters
-
+        self.nll_loss = nn.CrossEntropyLoss(reduction='none')
         # self.remove_root = []
         # self.remove_leaf = []
         # self.remove_root_and_leaf = []
@@ -484,9 +484,10 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
             if general_words_only:
                 head_logit = head_logit-getattr(self, 'remove_root_and_leaf_{}'.format(0))
             # head_logit[:,0] = -float('inf')
-            head_logprob = F.log_softmax(head_logit, dim=1)
 
-            nll = torch.zeros_like(target, dtype=hidden.dtype, device=hidden.device)
+
+            head_logprob = F.log_softmax(head_logit, dim=1)           
+            nll = torch.zeros_like(target, dtype=torch.float32, device=hidden.device)
 
             offset = 0
             cutoff_values = [0] + self.cutoffs
@@ -501,9 +502,10 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
 
                 target_i = target.index_select(0, indices_i) - l_idx
                 head_logprob_i = head_logprob.index_select(0, indices_i)
-
+                
                 if i == 0:
-                    logprob_i = head_logprob_i.gather(1, target_i[:, None]).squeeze(1)
+                    logprob_i = self.nll_loss(head_logit.index_select(0, indices_i).float(), target_i)
+                    # logprob_i = head_logprob_i.gather(1, target_i[:, None]).squeeze(1)
                 else:
                     weight_i, bias_i, proj_i = weights[i], biases[i], projs[i]
                     hidden_i = hidden.index_select(0, indices_i)
@@ -517,18 +519,20 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                         tail_logit_i -= getattr(self, 'remove_root_{}'.format(i))
                     if general_words_only:
                         tail_logit_i -= getattr(self, 'remove_root_and_leaf_{}'.format(i))
-                    tail_logprob_i = F.log_softmax(tail_logit_i, dim=1)
-
-                    logprob_i = head_logprob_i[:, -i] + tail_logprob_i.gather(
-                        1, target_i[:, None]
-                    ).squeeze(1)
+                    # tail_logprob_i = F.log_softmax(tail_logit_i, dim=1)
+                    logprob_i = self.nll_loss(tail_logit_i.float(), target_i) - head_logprob_i[:, -i]
+                    # logprob_i = head_logprob_i[:, -i] + tail_logprob_i.gather(
+                    #     1, target_i[:, None]
+                    # ).squeeze(1)
 
                 if (hasattr(self, "keep_order") and self.keep_order) or keep_order:
-                    nll.index_copy_(0, indices_i, -logprob_i)
+                    nll.index_copy_(0, indices_i, logprob_i)
                 else:
-                    nll[offset : offset + logprob_i.size(0)].copy_(-logprob_i)
+                    nll[offset : offset + logprob_i.size(0)].copy_(logprob_i)
 
                 offset += logprob_i.size(0)
+        # if sum(nll==0).item()>0:
+        #     print('error')
 
         return nll
 

@@ -251,8 +251,9 @@ def setup_model_and_optimizer(args):
     if args.load_checkpoint:
         if args.load_checkpoint=='best':
             args.iteration = load_checkpoint(model, optimizer, scheduler, args, best=True)
-        args.iteration = load_checkpoint(model, optimizer, scheduler, args, best=False, 
-        checkpoint_name=args.load_checkpoint)
+        else:
+            args.iteration = load_checkpoint(model, optimizer, scheduler, args, best=False, 
+            checkpoint_name=args.load_checkpoint)
     if args.fp16:
         model.forward = lambda *args, old_fwd = model.forward, input_caster = lambda tensor: tensor, output_caster = lambda tensor: tensor.to(amp._amp_state.opt_properties.options['cast_model_outputs'] if amp._amp_state.opt_properties.options.get('cast_model_outputs') is not None else torch.float32), **kwargs: amp._initialize.applier(old_fwd(*amp._initialize.applier(args, input_caster), **amp._initialize.applier(kwargs, input_caster)), output_caster)
     scaler = None
@@ -373,7 +374,6 @@ def sega_forward_step(data_iterator, model, mems, iteration, args):
     non_cl_loss = lm_loss[~root_mask]
     return lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems
 
-
 def backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args):
     if args.multi_obj:
         loss = 0.8*lm_loss + 0.2*auxiliary_loss
@@ -404,6 +404,11 @@ def backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args):
     return lm_loss, auxiliary_loss
 
 def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args):
+    if iteration < args.warmup_step:
+        curr_lr = args.lr * iteration / args.warmup_step
+        optimizer.param_groups[0]['lr'] = curr_lr
+    else:
+        lr_scheduler.step(iteration)
     if args.sega:
         lm_loss, auxiliary_loss, cl_loss, non_cl_loss, new_mems = sega_forward_step(data_iterator, model, mems, iteration, args)
     else:
@@ -411,7 +416,9 @@ def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iter
     if args.loss_length_scale and iteration<(args.max_step//3):
         scale_vec = torch.exp(torch.range(-(lm_loss.shape[0]+1)//2,(lm_loss.shape[0]+1)/2)*0.001)[:lm_loss.shape[0]].to(lm_loss.device)
         lm_loss = (lm_loss.t()* scale_vec).t()
-    if args.fp16:
+    # if (torch.isnan(lm_loss)).nonzero().shape[0]!=0:
+    #     print('error')
+    if args.fp16 and 0 in lm_loss:
         lm_loss = lm_loss[lm_loss!=0]
     lm_loss = lm_loss.mean().type_as(lm_loss)
     auxiliary_loss = auxiliary_loss.mean().type_as(auxiliary_loss)
@@ -419,11 +426,6 @@ def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iter
     lm_loss_reduced, auxiliary_loss_reduced = backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args)
     optimizer.step()
 
-    if iteration < args.warmup_step:
-        curr_lr = args.lr * iteration / args.warmup_step
-        optimizer.param_groups[0]['lr'] = curr_lr
-    else:
-        lr_scheduler.step(iteration)
     cl_loss = cl_loss.float().mean().type_as(cl_loss)
     non_cl_loss = non_cl_loss.float().mean().type_as(non_cl_loss)
 
@@ -483,6 +485,10 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
         # if hypernym_grad and args.learn_offset and iteration>args.cl_steps:
         #     model.module.change()
         #     hypernym_grad = False
+        if iteration % train_data_iterator.n_batch == 0:
+            mems = tuple()
+            if args.sega:
+                mems = [tuple(), tuple()]
         lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = train_step(train_data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args)
         iteration += 1
         current_lm_loss = lm_loss.data.detach().float().item()

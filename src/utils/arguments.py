@@ -38,7 +38,7 @@ ModelSizeArgs = {
         "dropout":0.2,
         "dropatt":0.2,
         "warmup_step":16000,
-        "div_val":4
+        "div_val":1
     }
 }
 
@@ -374,9 +374,9 @@ def get_args():
     if args.pt:
         # this hack is required to enable `pt monitor` *while the job is running*.
         delattr(tf.io.gfile.LocalFileSystem, 'append')
-        args.work_dir = os.environ.get('PT_OUTPUT_DIR', '.')
+        # args.work_dir = os.environ.get('PT_OUTPUT_DIR', '.')
+        args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d'))
     else:
-        # args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
         args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d'))
     if is_sagemaker:
         args.work_dir = os.environ['SM_MODEL_DIR']

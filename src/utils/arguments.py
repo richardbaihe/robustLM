@@ -38,7 +38,6 @@ ModelSizeArgs = {
         "dropout":0.2,
         "dropatt":0.2,
         "warmup_step":16000,
-        "div_val":1
     }
 }
 
@@ -282,6 +281,8 @@ def add_device_config_args(parser, is_sagemaker=False):
                         help='experiment directory.')
     group.add_argument('--job_name', default='example', type=str,
                         help='experimetn name')
+    group.add_argument('--gc_remote_path', default='', type=str,
+                        help="gcloud path")
 
     return parser
 

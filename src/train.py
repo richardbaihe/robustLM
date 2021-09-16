@@ -16,11 +16,11 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from apex import amp, optimizers
+# from apex import amp, optimizers
 from utils.arguments import get_args
 from data_utils import MixCorpus
 from utils.exp_utils import create_exp_dir, \
-    print_rank_0, save_checkpoint, load_checkpoint, get_params_for_weight_decay_optimization, Timers
+    print_rank_0, save_checkpoint, load_checkpoint, get_params_for_weight_decay_optimization, Timers, upload_model
 from mem_transformer import MemTransformerLM, SegaMemTransformerLM
 from utils.data_parallel import BalancedDataParallel
 
@@ -29,7 +29,7 @@ def wandb_init(args):
     if os.path.exists(id_path):
         wandb_id = json.load(open(id_path,'r'))['id']
     else:
-        os.makedirs(os.path.dirname(id_path))
+        os.makedirs(os.path.dirname(id_path),exist_ok=True)
         wandb_id = wandb.util.generate_id()
         json.dump({'id':wandb_id},open(id_path,'w'))
     wandb_config = json.load(open('wandb_config.json','r'))
@@ -458,6 +458,8 @@ def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iter
         non_cl_loss_reduced += non_cl_loss
 
         inner_step+=1
+        args.inner_start = None
+        args.inner_end = None
     if is_nan_detected:
         new_mems = reset_mems(args)
         if args.saved_nan == 0:
@@ -544,7 +546,8 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
                             device=device, ext_len=args.ext_len)
         if iteration % train_data_iterator.n_batch == 0:
             mems = reset_mems(args)
-            save_checkpoint(iteration, model, optimizer, lr_scheduler, args.work_dir, ckpt_folder_name='latest')
+            checkpoint_name = save_checkpoint(iteration, model, optimizer, lr_scheduler, args.work_dir, ckpt_folder_name='latest')
+            upload_model(checkpoint_name, args.gc_remote_path)
         lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = train_step(train_data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args)
         iteration += 1
         current_lm_loss = lm_loss.data.detach().float().item()
@@ -762,6 +765,8 @@ def main():
         args.gpu0_bsz = args.gpu0_bsz//2
     else:
         args.accumulation_steps = 1
+    args.inner_start = None
+    args.inner_end = None
     args.saved_nan = 0
     args.continous_nan = 0
     wandb_init(args)
@@ -783,10 +788,8 @@ def main():
 
     if args.do_train:
         train(model, optimizer, scheduler, scaler, corpus, tr_iter, va_iter, args)
-    if args.do_eval and args.checkpoint_dir:
-        for checkpoint_name in glob.glob(os.path.join(args.checkpoint_dir,'iter_*/model_optim_rng.pt')):
-            iteration = load_checkpoint(model, optimizer, scheduler, args, checkpoint_name=checkpoint_name)
-            evaluate_and_print_results(va_iter, model, args, iteration=iteration)
+    if args.do_eval and args.load_checkpoint:
+        evaluate_and_print_results(va_iter, model, args, iteration=args.iteration)
     if args.do_test:
         checkpoint_name = ""
         if args.checkpoint_dir:

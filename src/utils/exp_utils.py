@@ -5,12 +5,29 @@ import numpy as np
 import random
 import torch
 import torch.nn as nn
-from apex import amp
+# from apex import amp
 from utils.data_parallel import BalancedDataParallel
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-from apex.parallel import DistributedDataParallel as apexDDP
+# from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+# from apex.parallel import DistributedDataParallel as apexDDP
 from mpu.random import get_cuda_rng_tracker
-import mpu
+# import mpu
+
+def upload_model(local_path, remote_path):
+    """Saves the model to Google Cloud Storage
+    Args:
+      args: contains name for saved model.
+    """
+    if remote_path=='':
+        return
+    from google.cloud import storage
+    scheme = 'gs://'
+    bucket_name = "richardbaihe"
+    remote_path = '{}/{}/{}/{}'.format(remote_path.split('/')[-2], remote_path.split('/')[-1], local_path.split('/')[-2], local_path.split('/')[-1])
+    bucket = storage.Client().bucket(bucket_name)
+    blob = bucket.blob(remote_path)
+    blob.upload_from_filename(local_path)
+    blob = bucket.blob(remote_path.replace("model_optim_rng.pt","wandb.id"))
+    blob.upload_from_filename(local_path.replace("model_optim_rng.pt","wandb.id"))
 
 def get_params_for_weight_decay_optimization(module):
 
@@ -48,7 +65,7 @@ def get_checkpoint_tracker_filename(checkpoints_path):
 def save_checkpoint(iteration, model, optimizer, lr_scheduler, work_dir, ckpt_folder_name):
     """Save a model checkpoint."""
     # Only rank zer0 of the data parallel writes to the disk.
-    while isinstance(model, (nn.DataParallel, BalancedDataParallel, torchDDP)):
+    while isinstance(model, (nn.DataParallel, BalancedDataParallel)):
         model = model.module
     # if isinstance(model, torchDDP):
     #     model = model.module
@@ -74,7 +91,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, work_dir, ckpt_fo
         sd['np_rng_state'] = np.random.get_state()
         sd['torch_rng_state'] = torch.get_rng_state()
         sd['cuda_rng_state'] = torch.cuda.get_rng_state()
-        sd['rng_tracker_states'] = mpu.get_cuda_rng_tracker().get_states()
+        sd['rng_tracker_states'] = get_cuda_rng_tracker().get_states()
 
         ensure_directory_exists(checkpoint_name)
         torch.save(sd, checkpoint_name)
@@ -90,6 +107,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, work_dir, ckpt_fo
     # if not best:
     #     # Wait so everyone is done (not necessary)
     #     torch.distributed.barrier()
+    return checkpoint_name
 
 def load_checkpoint(model, optimizer, lr_scheduler, work_dir, ckpt_folder_name=None, checkpoint_name=""):
     """Load a model checkpoint."""
@@ -144,7 +162,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, work_dir, ckpt_folder_name=N
     np.random.set_state(sd['np_rng_state'])
     torch.set_rng_state(sd['torch_rng_state'])
     torch.cuda.set_rng_state(sd['cuda_rng_state'])
-    mpu.get_cuda_rng_tracker().set_states(sd['rng_tracker_states'])
+    get_cuda_rng_tracker().set_states(sd['rng_tracker_states'])
 
 
     # torch.distributed.barrier()

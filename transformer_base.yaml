@@ -86,6 +86,7 @@ search:
       --pt
       --do_train
       --do_test
+      --div_val 4
   type: grid
   max_trials: 12
   params:

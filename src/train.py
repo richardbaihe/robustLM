@@ -225,8 +225,15 @@ def setup_model_and_optimizer(args):
     #### scheduler
     scheduler = get_learning_rate_scheduler(optimizer, args)
     args.iteration = 0
-
-    if args.load_checkpoint:
+    if args.restart:
+        print('load from'+str(args.iteration))
+        os.system("gsutil cp gs://richardbaihe/"+args.restart_dir+"/model_optim_rng.pt "+
+        os.path.join([args.work_dir, args.restart_dir, "model_optim_rng.pt"]))
+        args.b = 0
+        args.max_step = args.max_step - args.iteration
+        args.iteration = 0
+        load_checkpoint(model, None, None, args.work_dir, ckpt_folder_name=args.restart_dir)
+    elif args.load_checkpoint:
         if args.load_checkpoint=='best':
             args.iteration = load_checkpoint(model, None, None, args.work_dir, ckpt_folder_name='best')
         elif args.load_checkpoint=='latest':
@@ -250,7 +257,9 @@ def setup_model_and_optimizer(args):
                                static_loss_scale = args.static_loss_scale,
                                dynamic_loss_scale = args.dynamic_loss_scale,
                                dynamic_loss_args = {'init_scale': 2 ** 16})
-        if args.load_checkpoint:
+        if args.restart:
+            load_checkpoint(None, optimizer, scheduler, args.work_dir, ckpt_folder_name=args.restart_dir)
+        elif args.load_checkpoint:
             if args.load_checkpoint=='latest':
                 load_checkpoint(None, optimizer, scheduler, args.work_dir, ckpt_folder_name="latest")
             else:

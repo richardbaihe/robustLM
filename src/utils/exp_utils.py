@@ -37,6 +37,7 @@ def download_model(local_path, remote_path):
     bucket_name = "richardbaihe"
     bucket = storage.Client().bucket(bucket_name)
     blob = bucket.blob(remote_path)
+    os.makedirs(os.path.dirname(local_path),exist_ok=True)
     blob.download_to_filename(local_path)
     print('Blob {} downloaded to {}.'.format(
          remote_path,
@@ -124,8 +125,8 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, work_dir, ckpt_fo
 
 def load_checkpoint(model, optimizer, lr_scheduler, work_dir, ckpt_folder_name=None, checkpoint_name=""):
     """Load a model checkpoint."""
-    # while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
-    #     model = model.module
+    while isinstance(model, (nn.DataParallel, BalancedDataParallel)):
+        model = model.module
     iteration = 0
     if not ckpt_folder_name and not checkpoint_name:
         # Read the tracker file and set the iteration.
@@ -161,6 +162,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, work_dir, ckpt_folder_name=N
 
     # Model.
     if model is not None and 'model' in sd.keys():
+        sd['model'] = {key.replace("module.", ""): value for key, value in sd['model'].items()}
         model.load_state_dict(sd['model'])
 
     # Optimizer.
@@ -175,7 +177,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, work_dir, ckpt_folder_name=N
     np.random.set_state(sd['np_rng_state'])
     torch.set_rng_state(sd['torch_rng_state'])
     torch.cuda.set_rng_state(sd['cuda_rng_state'])
-    get_cuda_rng_tracker().set_states(sd['rng_tracker_states'])
+    if 'rng_tracker_states' in sd.keys():
+        get_cuda_rng_tracker().set_states(sd['rng_tracker_states'])
 
 
     # torch.distributed.barrier()

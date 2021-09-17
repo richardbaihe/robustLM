@@ -24,7 +24,7 @@ from utils.exp_utils import create_exp_dir, \
     Timers, upload_model, download_model
 from mem_transformer import MemTransformerLM, SegaMemTransformerLM
 from utils.data_parallel import BalancedDataParallel
-
+ 
 def wandb_init(args):
     id_path = os.path.join(args.work_dir,'latest','wandb.id')
     if os.path.exists(id_path):
@@ -266,7 +266,7 @@ def setup_model_and_optimizer(args):
             if args.load_checkpoint=='latest':
                 load_checkpoint(None, optimizer, scheduler, args.work_dir, ckpt_folder_name="latest")
             else:
-                args.iteration = load_checkpoint(model, None, None, args.work_dir, ckpt_folder_name=None, 
+                args.iteration = load_checkpoint(None, optimizer, scheduler, args.work_dir, ckpt_folder_name=None, 
                 checkpoint_name=args.load_checkpoint)
     # if args.fp16:
         # model.forward = lambda *args, old_fwd = model.forward, input_caster = lambda tensor: tensor, output_caster = lambda tensor: tensor.to(amp._amp_state.opt_properties.options['cast_model_outputs'] if amp._amp_state.opt_properties.options.get('cast_model_outputs') is not None else torch.float32), **kwargs: amp._initialize.applier(old_fwd(*amp._initialize.applier(args, input_caster), **amp._initialize.applier(kwargs, input_caster)), output_caster)

@@ -20,7 +20,8 @@ import torch.optim as optim
 from utils.arguments import get_args
 from data_utils import MixCorpus
 from utils.exp_utils import create_exp_dir, \
-    print_rank_0, save_checkpoint, load_checkpoint, get_params_for_weight_decay_optimization, Timers, upload_model
+    print_rank_0, save_checkpoint, load_checkpoint, get_params_for_weight_decay_optimization, \
+    Timers, upload_model, download_model
 from mem_transformer import MemTransformerLM, SegaMemTransformerLM
 from utils.data_parallel import BalancedDataParallel
 
@@ -226,13 +227,15 @@ def setup_model_and_optimizer(args):
     scheduler = get_learning_rate_scheduler(optimizer, args)
     args.iteration = 0
     if args.restart:
-        print('load from'+str(args.iteration))
-        os.system("gsutil cp gs://richardbaihe/"+args.restart_dir+"/model_optim_rng.pt "+
-        os.path.join([args.work_dir, args.restart_dir, "model_optim_rng.pt"]))
-        args.b = 0
-        args.max_step = args.max_step - args.iteration
+        remote_path = args.restart_dir+"/model_optim_rng.pt"
+        local_path = os.path.join(args.work_dir, args.restart_dir, "model_optim_rng.pt")
+        download_model(local_path, remote_path)
+
+        iteration = load_checkpoint(model, None, None, args.work_dir, ckpt_folder_name=args.restart_dir)
+        print('load from'+str(iteration))
+        args.max_step = args.max_step - iteration
         args.iteration = 0
-        load_checkpoint(model, None, None, args.work_dir, ckpt_folder_name=args.restart_dir)
+        args.b = 0
     elif args.load_checkpoint:
         if args.load_checkpoint=='best':
             args.iteration = load_checkpoint(model, None, None, args.work_dir, ckpt_folder_name='best')

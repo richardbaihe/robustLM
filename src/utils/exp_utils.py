@@ -29,6 +29,19 @@ def upload_model(local_path, remote_path):
     blob = bucket.blob(remote_path.replace("model_optim_rng.pt","wandb.id"))
     blob.upload_from_filename(local_path.replace("model_optim_rng.pt","wandb.id"))
 
+def download_model(local_path, remote_path):
+    if remote_path=='':
+        return
+    from google.cloud import storage
+    scheme = 'gs://'
+    bucket_name = "richardbaihe"
+    bucket = storage.Client().bucket(bucket_name)
+    blob = bucket.blob(remote_path)
+    blob.download_to_filename(local_path)
+    print('Blob {} downloaded to {}.'.format(
+         remote_path,
+         local_path))
+
 def get_params_for_weight_decay_optimization(module):
 
     weight_decay_params = {'params': []}

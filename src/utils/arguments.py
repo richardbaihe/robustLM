@@ -37,8 +37,6 @@ ModelSizeArgs = {
         "eval_tgt_len":384,
         "dropout":0.2,
         "dropatt":0.2,
-        "warmup_step":16000,
-        "div_val":4
     }
 }
 
@@ -137,10 +135,10 @@ def add_training_config_args(parser, is_sagemaker=False):
                             help='use variable length')
         group.add_argument('--same_length', action='store_true',
                             help='use the same attn length for all tokens')
-        group.add_argument('--loss_length_scale', action='store_true', 
-                            help='scale loss according to the position of tokens')   
+        group.add_argument('--loss_length_scale', action='store_true',
+                            help='scale loss according to the position of tokens')
     group.add_argument('--load_checkpoint', type=str, default="",
-                    help='continue training from lastest checkpoint') 
+                    help='continue training from lastest checkpoint')
     group.add_argument('--log_interval', type=int, default=200,
                         help='report interval')
     group.add_argument('--eval_interval', type=int, default=4000,
@@ -169,6 +167,8 @@ def add_training_config_args(parser, is_sagemaker=False):
                         help='upper epoch limit')
     group.add_argument('--batch_size', type=int, default=60,
                         help='batch size')
+    group.add_argument('--accumulation_steps', type=int, default=1,
+                        help='gradient accumulation')
     group.add_argument('--gpu0_bsz', type=int, default=-1,
                         help='batch size on gpu 0')
     group.add_argument('--batch_chunk', type=int, default=1,
@@ -190,7 +190,7 @@ def add_training_config_args(parser, is_sagemaker=False):
                         help='restart dir')
     group.add_argument('--patience', type=int, default=0,
                         help='patience')
-    
+
     # distributed training args
     group.add_argument('--distributed-backend', default='nccl',
                        help='which backend to use for distributed '
@@ -229,7 +229,7 @@ def add_data_config_args(parser, is_sagemaker=False):
                         choices=['wt103', 'lm1b', 'enwik8', 'text8'],
                         help='dataset name')
     if is_sagemaker:
-                
+
         group.add_argument('--do_train', type=boolean_string, default=False,
                             help='train model')
         group.add_argument('--do_test', type=boolean_string, default=False,
@@ -274,7 +274,9 @@ def add_device_config_args(parser, is_sagemaker=False):
         group.add_argument('--pt', action='store_true',
                             help='phillytool or local')
         group.add_argument('--wandb_offline', action='store_true',
-                            help='debugging offline')   
+                            help='debugging offline')
+    group.add_argument('--wandb_id', default='', type=str,
+                    help='id of wandb')
     group.add_argument('--static-loss-scale', type=float, default=1,
                         help='Static loss scale, positive power of 2 values can '
                         'improve fp16 convergence.')
@@ -282,6 +284,8 @@ def add_device_config_args(parser, is_sagemaker=False):
                         help='experiment directory.')
     group.add_argument('--job_name', default='example', type=str,
                         help='experimetn name')
+    group.add_argument('--gc_remote_path', default='', type=str,
+                        help="gcloud path")
 
     return parser
 
@@ -301,7 +305,7 @@ def add_classLM_config_args(parser, is_sagemaker=False):
         group.add_argument('--mix_vocab',  type=boolean_string, default=False,
                         help='predict class label and general words together in a mixed vocab')
         group.add_argument('--adaptive_class_softmax',  type=boolean_string, default=False,
-                        help='if true, predict class first and then predict the token')       
+                        help='if true, predict class first and then predict the token')
         group.add_argument('--learn_offset',  type=boolean_string, default=False,
                         help='if true, add hypernym embedding to the offset embedding')
         group.add_argument('--vocab_order_hypernym_last',  type=boolean_string, default=False,
@@ -316,7 +320,7 @@ def add_classLM_config_args(parser, is_sagemaker=False):
         group.add_argument('--mix_vocab', action='store_true',
                         help='predict class label and general words together in a mixed vocab')
         group.add_argument('--adaptive_class_softmax', action='store_true',
-                            help='if true, predict class first and then predict the token')       
+                            help='if true, predict class first and then predict the token')
         group.add_argument('--learn_offset', action='store_true',
                             help='if true, add hypernym embedding to the offset embedding')
         group.add_argument('--vocab_order_hypernym_last', action='store_true',
@@ -374,10 +378,11 @@ def get_args():
     if args.pt:
         # this hack is required to enable `pt monitor` *while the job is running*.
         delattr(tf.io.gfile.LocalFileSystem, 'append')
-        args.work_dir = os.environ.get('PT_OUTPUT_DIR', '.')
-    else:
-        # args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
+        # args.work_dir = os.environ.get('PT_OUTPUT_DIR', '.')
         args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d'))
+    else:
+        args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d'))
+        os.makedirs(args.work_dir, exist_ok=True)
     if is_sagemaker:
         args.work_dir = os.environ['SM_MODEL_DIR']
         args.data = os.environ['SM_CHANNEL_DATA']

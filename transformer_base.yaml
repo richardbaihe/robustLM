@@ -41,7 +41,6 @@ jobs:
     --gpu0_bsz 8
     --mem_len 384
     --sega
-    --init_std 0.01
     --model_size large
     --dataset wt103
     --adaptive
@@ -52,6 +51,8 @@ jobs:
     --pt
     --do_train
     --do_test
+    --load_checkpoint latest 
+    --work_dir ${A_PATH}
 
 search:
   job_template:
@@ -85,6 +86,7 @@ search:
       --pt
       --do_train
       --do_test
+      --div_val 4
   type: grid
   max_trials: 12
   params:

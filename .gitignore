@@ -34,3 +34,11 @@ src/wandb/
 pt/
 data/
 output/
+*.*config
+ipynb/
+.ipynb_checkpoints/
+Docker*
+*.sh
+setup.py
+gc_config.yaml
+brown-cluster/

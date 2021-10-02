@@ -2,14 +2,46 @@ import functools
 import os, shutil, time
 
 import numpy as np
-import mpu
 import random
 import torch
 import torch.nn as nn
-from fp16 import FP16_Module
-from fp16 import FP16_Optimizer
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-from apex.parallel import DistributedDataParallel as apexDDP
+# from apex import amp
+from utils.data_parallel import BalancedDataParallel
+# from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+# from apex.parallel import DistributedDataParallel as apexDDP
+from mpu.random import get_cuda_rng_tracker
+# import mpu
+
+def upload_model(local_path, remote_path):
+    """Saves the model to Google Cloud Storage
+    Args:
+      args: contains name for saved model.
+    """
+    if remote_path=='':
+        return
+    from google.cloud import storage
+    scheme = 'gs://'
+    bucket_name = "richardbaihe"
+    remote_path = '{}/{}/{}/{}'.format(remote_path.split('/')[-2], remote_path.split('/')[-1], local_path.split('/')[-2], local_path.split('/')[-1])
+    bucket = storage.Client().bucket(bucket_name)
+    blob = bucket.blob(remote_path)
+    blob.upload_from_filename(local_path)
+    # blob = bucket.blob(remote_path.replace("model_optim_rng.pt","wandb.id"))
+    # blob.upload_from_filename(local_path.replace("model_optim_rng.pt","wandb.id"))
+
+def download_model(local_path, remote_path):
+    if remote_path=='':
+        return
+    from google.cloud import storage
+    scheme = 'gs://'
+    bucket_name = "richardbaihe"
+    bucket = storage.Client().bucket(bucket_name)
+    blob = bucket.blob(remote_path)
+    os.makedirs(os.path.dirname(local_path),exist_ok=True)
+    blob.download_to_filename(local_path)
+    print('Blob {} downloaded to {}.'.format(
+         remote_path,
+         local_path))
 
 def get_params_for_weight_decay_optimization(module):
 
@@ -30,12 +62,10 @@ def get_params_for_weight_decay_optimization(module):
 
     return weight_decay_params, no_weight_decay_params
 
-def get_checkpoint_name(checkpoints_path, iteration, best=False, mp_rank=None):
-    if best:
-        d = 'best'
-    else:
-        d = 'iter_{:07d}'.format(iteration)
-    return os.path.join(checkpoints_path, d,
+def get_checkpoint_name(checkpoints_path, iteration, ckpt_folder_name=None, mp_rank=None):
+    if ckpt_folder_name is None:
+        ckpt_folder_name = 'iter_{:07d}'.format(iteration)
+    return os.path.join(checkpoints_path, ckpt_folder_name,
                         'model_optim_rng.pt')
 
 def ensure_directory_exists(filename):
@@ -46,15 +76,16 @@ def ensure_directory_exists(filename):
 def get_checkpoint_tracker_filename(checkpoints_path):
     return os.path.join(checkpoints_path, 'latest_checkpointed_iteration.txt')
 
-def save_checkpoint(iteration, model, optimizer, lr_scheduler, args, best):
+
+def save_checkpoint(iteration, model, optimizer, lr_scheduler, work_dir, ckpt_folder_name):
     """Save a model checkpoint."""
     # Only rank zer0 of the data parallel writes to the disk.
-    # while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
-    #     model = model.module
+    while isinstance(model, (nn.DataParallel, BalancedDataParallel)):
+        model = model.module
     # if isinstance(model, torchDDP):
     #     model = model.module
     if True:
-        checkpoint_name = get_checkpoint_name(args.work_dir, iteration, best)
+        checkpoint_name = get_checkpoint_name(work_dir, iteration, ckpt_folder_name)
 
         print('saving checkpoint at iteration {:7d} to {}'.
               format(iteration, checkpoint_name))
@@ -82,22 +113,24 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, args, best):
     #     # Wait so everyone is done (necessary)
     #     torch.distributed.barrier()
     # And update the latest iteration
-    if not best:
-        tracker_filename = get_checkpoint_tracker_filename(args.work_dir)
+    if ckpt_folder_name!='best':
+        tracker_filename = get_checkpoint_tracker_filename(work_dir)
         with open(tracker_filename, 'w') as f:
             f.write(str(iteration))
     # if not best:
     #     # Wait so everyone is done (not necessary)
     #     torch.distributed.barrier()
+    return checkpoint_name
 
-def load_checkpoint(model, optimizer, lr_scheduler, args, best=False, checkpoint_name=""):
+
+def load_checkpoint(model, optimizer, lr_scheduler, work_dir, ckpt_folder_name=None, checkpoint_name=""):
     """Load a model checkpoint."""
-    # while isinstance(model, (torchDDP, apexDDP, FP16_Module)):
-    #     model = model.module
+    while isinstance(model, (nn.DataParallel, BalancedDataParallel)):
+        model = model.module
     iteration = 0
-    if not best and not checkpoint_name:
+    if not ckpt_folder_name and not checkpoint_name:
         # Read the tracker file and set the iteration.
-        tracker_filename = get_checkpoint_tracker_filename(args.work_dir)
+        tracker_filename = get_checkpoint_tracker_filename(work_dir)
         if not os.path.isfile(tracker_filename):
             print('WARNING: could not find the metadata file {} '.format(
                 tracker_filename))
@@ -111,7 +144,13 @@ def load_checkpoint(model, optimizer, lr_scheduler, args, best=False, checkpoint
             tracker_filename)
     if not checkpoint_name:
         # Checkpoint.
-        checkpoint_name = get_checkpoint_name(args.work_dir, iteration, best)
+        checkpoint_name = get_checkpoint_name(work_dir, iteration, ckpt_folder_name)
+        if not os.path.isfile(checkpoint_name):
+            print('WARNING: could not find the metadata file {} '.format(
+                checkpoint_name))
+            print('    will not load any checkpoints and will start from '
+                        'random')
+            return 0
     print(' is loading checkpoint {}'.format(
             checkpoint_name))
 
@@ -122,19 +161,26 @@ def load_checkpoint(model, optimizer, lr_scheduler, args, best=False, checkpoint
     iteration = sd['iteration']
 
     # Model.
-    model.load_state_dict(sd['model'])
+    if model is not None and 'model' in sd.keys():
+        sd['model'] = {key.replace("module.", ""): value for key, value in sd['model'].items()}
+        model.load_state_dict(sd['model'])
 
     # Optimizer.
     if optimizer is not None and 'optimizer' in sd.keys():
-        optimizer.load_state_dict(sd['optimizer'])
+        if 'optimizer_state_dict' in sd['optimizer']:
+            optimizer.load_state_dict(sd['optimizer']['optimizer_state_dict'])
+        else:
+            optimizer.load_state_dict(sd['optimizer'])
     if lr_scheduler is not None and 'lr_scheduler' in sd.keys():
         lr_scheduler.load_state_dict(sd['lr_scheduler'])
-
     # rng states.
-    random.setstate(sd['random_rng_state'])
-    np.random.set_state(sd['np_rng_state'])
-    torch.set_rng_state(sd['torch_rng_state'])
-    torch.cuda.set_rng_state(sd['cuda_rng_state'])
+    if 'random_rng_state' in sd.keys() and 'np_rng_state' in sd.keys() and 'torch_rng_state' in sd.keys():
+        random.setstate(sd['random_rng_state'])
+        np.random.set_state(sd['np_rng_state'])
+        torch.set_rng_state(sd['torch_rng_state'])
+        torch.cuda.set_rng_state(sd['cuda_rng_state'])
+    if 'rng_tracker_states' in sd.keys():
+        get_cuda_rng_tracker().set_states(sd['rng_tracker_states'])
 
 
     # torch.distributed.barrier()

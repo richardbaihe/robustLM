@@ -1,7 +1,6 @@
 import os
 import sys
 import glob
-import mpu
 from collections import Counter, OrderedDict, defaultdict
 import numpy as np
 import torch

@@ -9,7 +9,7 @@ target:
 environment:
   # image: nvidia/pytorch:20.12-py3
   # registry: nvcr.io
-  image: richardbaihe/pytorch:azure
+  image: richardbaihe/pytorch:azure_a100
   setup:
     - export MKL_SERVICE_FORCE_INTEL=1 
     - python -m nltk.downloader punkt wordnet

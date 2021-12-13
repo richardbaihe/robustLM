@@ -11,6 +11,104 @@ from utils.data_parallel import BalancedDataParallel
 # from apex.parallel import DistributedDataParallel as apexDDP
 from mpu.random import get_cuda_rng_tracker
 # import mpu
+from torch.optim.lr_scheduler import _LRScheduler
+
+class CosineAnnealingLR(_LRScheduler):
+    r"""Set the learning rate of each parameter group using a cosine annealing
+    schedule, where :math:`\eta_{max}` is set to the initial lr and
+    :math:`T_{cur}` is the number of epochs since the last restart in SGDR:
+
+    .. math::
+        \begin{aligned}
+            \eta_t & = \eta_{min} + \frac{1}{2}(\eta_{max} - \eta_{min})\left(1
+            + \cos\left(\frac{T_{cur}}{T_{max}}\pi\right)\right),
+            & T_{cur} \neq (2k+1)T_{max}; \\
+            \eta_{t+1} & = \eta_{t} + \frac{1}{2}(\eta_{max} - \eta_{min})
+            \left(1 - \cos\left(\frac{1}{T_{max}}\pi\right)\right),
+            & T_{cur} = (2k+1)T_{max}.
+        \end{aligned}
+
+    When last_epoch=-1, sets initial lr as lr. Notice that because the schedule
+    is defined recursively, the learning rate can be simultaneously modified
+    outside this scheduler by other operators. If the learning rate is set
+    solely by this scheduler, the learning rate at each step becomes:
+
+    .. math::
+        \eta_t = \eta_{min} + \frac{1}{2}(\eta_{max} - \eta_{min})\left(1 +
+        \cos\left(\frac{T_{cur}}{T_{max}}\pi\right)\right)
+
+    It has been proposed in
+    `SGDR: Stochastic Gradient Descent with Warm Restarts`_. Note that this only
+    implements the cosine annealing part of SGDR, and not the restarts.
+
+    Args:
+        optimizer (Optimizer): Wrapped optimizer.
+        T_max (int): Maximum number of iterations.
+        eta_min (float): Minimum learning rate. Default: 0.
+        last_epoch (int): The index of last epoch. Default: -1.
+        verbose (bool): If ``True``, prints a message to stdout for
+            each update. Default: ``False``.
+
+    .. _SGDR\: Stochastic Gradient Descent with Warm Restarts:
+        https://arxiv.org/abs/1608.03983
+    """
+
+    def __init__(self, optimizer, args, last_epoch=-1, verbose=False):
+        self.T_max = args.max_step
+        self.min_lr = args.lr_min
+        self.max_lr = args.lr_max
+        self.t_mult = args.t_mult
+        self.period = args.max_step- args.warmup_step
+        self.lr_shrink = args.lr_shrink
+        warmup_end_lr = args.lr_max 
+        if args.warmup_step > 0:
+            # linearly warmup for the first args.warmup_step
+            self.lr_step = (warmup_end_lr - args.warmup_init_lr) / args.warmup_step
+        else:
+            self.lr_step = 1
+
+        super(CosineAnnealingLR, self).__init__(optimizer, last_epoch, verbose)
+
+    def get_lr(self):
+        if self.last_epoch<self.args.warmup_step:
+            return  self.args.warmup_init_lr + self.last_epoch * self.lr_step
+        else:
+            curr_updates = self.last_epoch - self.args.warmup_step
+            if self.t_mult != 1:
+                i = math.floor(math.log(1 - curr_updates / self.period * (1 - self.t_mult), self.t_mult))
+                t_i = self.t_mult ** i * self.period
+                t_curr = curr_updates - (1 - self.t_mult ** i) / (1 - self.t_mult) * self.period
+            else:
+                i = math.floor(curr_updates / self.period)
+                t_i = self.period
+                t_curr = curr_updates - (self.period * i)
+            lr_shrink = self.lr_shrink ** i
+            min_lr = self.min_lr * lr_shrink
+            max_lr = self.max_lr * lr_shrink
+
+            lr = min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * t_curr / t_i))
+            return lr
+
+    def _get_closed_form_lr(self):
+        if self.last_epoch<self.args.warmup_step:
+            return self.args.warmup_init_lr + self.last_epoch * self.lr_step
+        else:
+            curr_updates = self.last_epoch - self.args.warmup_step
+            if self.t_mult != 1:
+                i = math.floor(math.log(1 - curr_updates / self.period * (1 - self.t_mult), self.t_mult))
+                t_i = self.t_mult ** i * self.period
+                t_curr = curr_updates - (1 - self.t_mult ** i) / (1 - self.t_mult) * self.period
+            else:
+                i = math.floor(curr_updates / self.period)
+                t_i = self.period
+                t_curr = curr_updates - (self.period * i)
+            lr_shrink = self.lr_shrink ** i
+            min_lr = self.min_lr * lr_shrink
+            max_lr = self.max_lr * lr_shrink
+
+            lr = min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * t_curr / t_i))
+            return lr
+
 
 def upload_model(local_path, remote_path):
     """Saves the model to Google Cloud Storage

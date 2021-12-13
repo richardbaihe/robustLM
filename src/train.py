@@ -13,7 +13,7 @@ from collections import defaultdict
 # import scipy.stats as ss
 from tqdm import tqdm
 from apex import amp, optimizers
-
+from mosestokenizer import *
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -25,26 +25,22 @@ from utils.exp_utils import create_exp_dir, \
     Timers, upload_model, download_model
 from mem_transformer import MemTransformerLM, SegaMemTransformerLM
 from utils.data_parallel import BalancedDataParallel
- 
+from utils.exp_utils import CosineAnnealingLR
+# import slurm
+import subprocess
+MAXIMUM_SAVE_TIME = 3.4*2000
+
 def wandb_init(args):
-    id_path = os.path.join(args.work_dir,'latest','wandb.id')
-    if args.wandb_id:
-        wandb_id = args.wandb_id
-        os.makedirs(os.path.dirname(id_path),exist_ok=True)
-        json.dump({'id':wandb_id},open(id_path,'w'))
-    elif os.path.exists(id_path):
-        wandb_id = json.load(open(id_path,'r'))['id']
-    else:
-        os.makedirs(os.path.dirname(id_path),exist_ok=True)
-        wandb_id = wandb.util.generate_id()
-        json.dump({'id':wandb_id},open(id_path,'w'))
     wandb_config = json.load(open('wandb_config.json','r'))
     if args.wandb_offline:
         os.environ['WANDB_MODE'] ="offline"
     os.environ['WANDB_API_KEY'] = wandb_config['WANDB_API_KEY']
     os.environ['WANDB_ENTITY'] = wandb_config['WANDB_ENTITY']
     os.environ['WANDB_PROJECT'] = wandb_config['WANDB_PROJECT']
-    wandb.init(config=args,name=args.job_name,id=wandb_id,resume="allow")
+    if args.wandb_id:
+        wandb.init(config=args,name=args.job_name,id=args.wandb_id,resume="allow")
+    else:
+        wandb.init(config=args,name=args.job_name,resume="allow")
 
 def set_random_seed(seed):
     """Set random seed for reproducability."""
@@ -60,10 +56,16 @@ def get_lm_corpus(args):
     if args.dataset in ['wt103']:
         kwargs['special'] = ['<eos>', '<sent_eos>']
         kwargs['lower_case'] = False
+        args.bpe=False
+    elif args.dataset in ['arxiv']:
+        kwargs['special'] = ['<eos>', '<sent_eos>']
+        kwargs['lower_case'] = False
+        kwargs['tokenizer_path'] = os.path.join(args.data,'my-bpe.tokenizer.json')
+        args.bpe = True
     else:
         raise NotImplementedError
     fn = os.path.join(args.data, '_'.join(['sega',str(args.sega)[0], 
-    'mix', str(args.mix_vocab)[0], 'cache.pt']) )
+    'mix', str(args.mix_vocab)[0],str(args.ignore_freqency_threshold), 'cache.pt']) )
     if os.path.exists(fn):
         print('Loading cached dataset...')
         corpus = torch.load(fn)
@@ -159,61 +161,6 @@ def get_model(args):
             if hasattr(m, 'r_bias'):
                 init_bias(m.r_bias)
 
-    if args.sega:
-        model = SegaMemTransformerLM(args.n_token, args.n_layer, args.n_head, args.d_model,
-        args.d_head, args.d_inner, args.dropout, args.dropatt,
-        tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
-        tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
-        ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
-        same_length=args.same_length, attn_type=args.attn_type,
-        clamp_len=args.clamp_len, sample_softmax=args.sample_softmax,cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index, adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict, word2class_id=args.word2class_id,mix_vocab=args.mix_vocab)
-    else:
-        model = MemTransformerLM(args.n_token, args.n_layer, args.n_head, args.d_model,
-            args.d_head, args.d_inner, args.dropout, args.dropatt,
-            tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
-            tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
-            ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
-            same_length=args.same_length, attn_type=args.attn_type,
-            clamp_len=args.clamp_len, sample_softmax=args.sample_softmax, 
-                                    cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index, adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict, word2class_id=args.word2class_id,mix_vocab=args.mix_vocab)
-    model.apply(weights_init)
-    model.word_emb.apply(weights_init) # ensure embedding init is not overridden by out_layer in case of weight sharing
-    # if args.learn_offset:
-    #     model.hypernym_emb.apply(weights_init)
-    #     model.hypernym_emb.weight.data[0,:] = 0
-    args.n_all_param = sum([p.nelement() for p in model.parameters()])
-    args.n_nonemb_param = sum([p.nelement() for p in model.layers.parameters()])
-    model = model.to(device)
-    return model
-
-def get_optimizer(model, args):
-   
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-
-    return optimizer
-
-def get_learning_rate_scheduler(optimizer, args):
-    if args.scheduler == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
-            args.max_step, eta_min=args.eta_min) # should use eta_min arg
-    elif args.scheduler == 'inv_sqrt':
-        # originally used for Transformer (in Attention is all you need)
-        def lr_lambda(step):
-            # return a multiplier instead of a learning rate
-            if step == 0 and args.warmup_step == 0:
-                return 1.
-            else:
-                return 1. / (step ** 0.5) if step > args.warmup_step \
-                    else step / (args.warmup_step ** 1.5)
-        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-    elif args.scheduler == 'dev_perf':
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
-            factor=args.decay_rate, patience=args.patience, min_lr=args.lr_min)
-    elif args.scheduler == 'constant':
-        pass
-    return scheduler
-
-def setup_model_and_optimizer(args):
     def update_dropout(m):
         classname = m.__class__.__name__
         if classname.find('Dropout') != -1:
@@ -223,48 +170,152 @@ def setup_model_and_optimizer(args):
     def update_dropatt(m):
         if hasattr(m, 'dropatt'):
             m.dropatt.p = args.dropatt
+
+    if args.restart:
+        if args.gc_remote_path:
+            remote_path = args.restart_dir+"/model.pt"
+            local_path = os.path.join(args.work_dir, "model.pt")
+            download_model(local_path, remote_path)
+        else:
+            local_path = os.path.join(args.restart_dir, "model.pt")
+        if os.path.exists(local_path):
+            with open(local_path, 'rb') as f:
+                model = torch.load(f)
+            if not args.fp16:
+                model = model.float()
+            model.apply(update_dropout)
+            model.apply(update_dropatt)
+        else:
+            if args.sega:
+                model = SegaMemTransformerLM(args.n_token, args.n_layer, args.n_head, args.d_model,
+                args.d_head, args.d_inner, args.dropout, args.dropatt,
+                tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
+                tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
+                ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
+                same_length=args.same_length, attn_type=args.attn_type,
+                clamp_len=args.clamp_len, sample_softmax=args.sample_softmax,cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index, adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict, word2class_id=args.word2class_id,mix_vocab=args.mix_vocab)
+            else:
+                model = MemTransformerLM(args.n_token, args.n_layer, args.n_head, args.d_model,
+                    args.d_head, args.d_inner, args.dropout, args.dropatt,
+                    tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
+                    tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
+                    ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
+                    same_length=args.same_length, attn_type=args.attn_type,
+                    clamp_len=args.clamp_len, sample_softmax=args.sample_softmax, 
+                                            cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index, adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict, word2class_id=args.word2class_id,mix_vocab=args.mix_vocab)
+            model.apply(weights_init)
+            model.word_emb.apply(weights_init) # ensure embedding init is not overridden by out_layer in case of weight sharing
+    else:
+        if args.sega:
+            model = SegaMemTransformerLM(args.n_token, args.n_layer, args.n_head, args.d_model,
+            args.d_head, args.d_inner, args.dropout, args.dropatt,
+            tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
+            tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
+            ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
+            same_length=args.same_length, attn_type=args.attn_type,
+            clamp_len=args.clamp_len, sample_softmax=args.sample_softmax,cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index, adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict, word2class_id=args.word2class_id,mix_vocab=args.mix_vocab)
+        else:
+            model = MemTransformerLM(args.n_token, args.n_layer, args.n_head, args.d_model,
+                args.d_head, args.d_inner, args.dropout, args.dropatt,
+                tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
+                tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
+                ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
+                same_length=args.same_length, attn_type=args.attn_type,
+                clamp_len=args.clamp_len, sample_softmax=args.sample_softmax, 
+                                        cl_all_root_index=args.cl_all_root_index, cl_all_leaf_index=args.cl_all_leaf_index, adaptive_class_softmax=args.adaptive_class_softmax, cl_root_leaf_dict=args.cl_root_leaf_dict, word2class_id=args.word2class_id,mix_vocab=args.mix_vocab)
+        model.apply(weights_init)
+        model.word_emb.apply(weights_init) # ensure embedding init is not overridden by out_layer in case of weight sharing
+        
+        # if args.learn_offset:
+    #     model.hypernym_emb.apply(weights_init)
+    #     model.hypernym_emb.weight.data[0,:] = 0
+    args.n_all_param = sum([p.nelement() for p in model.parameters()])
+    args.n_nonemb_param = sum([p.nelement() for p in model.layers.parameters()])
+    if args.fp16:
+        model = model.half()
+
+    if args.multi_gpu:
+        model = model.to(device)
+        if args.gpu0_bsz >= 0:
+            para_model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk,
+                                              model, dim=1).to(device)
+        else:
+            para_model = nn.DataParallel(model, dim=1).to(device)
+    else:
+        para_model = model.to(device)
+    
+    return para_model
+
+def get_optimizer(model, args):
+    if args.optim == 'nag':
+        optimizer = optim.SGD(model.parameters(), lr=args.lr, 
+        momentum=args.mom, nesterov=True)
+    elif args.optim == 'adam':
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    else:
+        raise NotImplementedError()
+    return optimizer
+
+def get_learning_rate_scheduler(optimizer, args):
+    if args.scheduler == 'cosine':
+        scheduler = CosineAnnealingLR(optimizer,
+            args) # should use eta_min arg
+    else:
+        raise NotImplementedError()
+    return scheduler
+
+def setup_model_and_optimizer(args):
+    if args.fp16:
+        if not args.cuda:
+            print('WARNING: --fp16 requires --cuda, ignoring --fp16 option')
+            args.fp16 = False
+        else:
+            try:
+                from apex.fp16_utils import FP16_Optimizer
+            except:
+                print('WARNING: apex not installed, ignoring --fp16 option')
+                args.fp16 = False
+
     device = torch.device('cuda' if args.cuda else 'cpu')
+
     #### get model
     model = get_model(args)
     #### optimizer
     optimizer = get_optimizer(model, args)
     #### scheduler
     scheduler = get_learning_rate_scheduler(optimizer, args)
-    args.iteration = 0
-    if args.fp16:
-        model, optimizer = amp.initialize(torch.nn.Sequential(model), optimizer,
-                                    opt_level="O2",
-                                    loss_scale='dynamic')
-        model = model[0]
-    if args.gpu0_bsz >= 0:
-        model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk,
-                                        model, dim=1).to(device)
-    else:
-        model = nn.DataParallel(model, dim=1).to(device)
-
+    if args.cuda and args.fp16:
+    # If args.dynamic_loss_scale is False, static_loss_scale will be used.
+    # If args.dynamic_loss_scale is True, it will take precedence over static_loss_scale.
+        optimizer = FP16_Optimizer(optimizer,
+                                  static_loss_scale = args.static_loss_scale,
+                                  dynamic_loss_scale = args.dynamic_loss_scale,
+                                  dynamic_loss_args = {'init_scale': 2 ** 16})
     args.restart_iteration = 0
     if args.restart:
+        local_path = os.path.join(args.work_dir, "optimizer.pt")
         if args.gc_remote_path:
-            remote_path = args.restart_dir+"/model_optim_rng.pt"
-            local_path = os.path.join(args.work_dir, args.restart_dir, "model_optim_rng.pt")
-            download_model(local_path, remote_path)
-            args.iteration = load_checkpoint(model, optimizer, None, args.work_dir, ckpt_folder_name=args.restart_dir)
+          remote_path = args.restart_dir+"/optimizer.pt"
+          try:
+              download_model(local_path, remote_path)
+          except:
+              print('gc optimizer not found')
         else:
-            args.iteration = load_checkpoint(model, optimizer, None, args.work_dir, checkpoint_name=args.restart_dir)
-        args.restart_iteration = args.iteration
-        print('load from'+str(args.iteration ))
-    elif args.load_checkpoint:
-        if args.load_checkpoint=='best':
-            args.iteration = load_checkpoint(model, optimizer, scheduler, args.work_dir, ckpt_folder_name='best')
-        elif args.load_checkpoint=='latest':
-            args.iteration = load_checkpoint(model, optimizer, scheduler, args.work_dir, ckpt_folder_name='latest')
+            local_path = os.path.join(args.restart_dir, "optimizer.pt")
+        if os.path.exists(local_path):
+            with open(local_path, 'rb') as f:
+                opt_state_dict = torch.load(f)
+                if 'loss_scaler' in opt_state_dict.keys() and not args.fp16:
+                    opt_state_dict = opt_state_dict['optimizer_state_dictb']
+                optimizer.load_state_dict(opt_state_dict)
         else:
-            args.iteration = load_checkpoint(model, optimizer, scheduler, args.work_dir, ckpt_folder_name=None, 
-            checkpoint_name=args.load_checkpoint)
-        model.apply(update_dropout)
-        model.apply(update_dropatt)
-    if args.fp16:
-        model.forward = lambda *args, old_fwd = model.forward, input_caster = lambda tensor: tensor, output_caster = lambda tensor: tensor.to(amp._amp_state.opt_properties.options['cast_model_outputs'] if amp._amp_state.opt_properties.options.get('cast_model_outputs') is not None else torch.float32), **kwargs: amp._initialize.applier(old_fwd(*amp._initialize.applier(args, input_caster), **amp._initialize.applier(kwargs, input_caster)), output_caster)
+            print('Optimizer was not saved. Start from scratch.')
+        try:
+            with open(os.path.join(args.work_dir,'iteration.txt'),'r') as f:
+                args.restart_iteration = int(f.readline().strip())
+        except:
+            args.restart_iteration = 0
+        # args.warmup_step = args.warmup_step-args.restart_iteration
     scaler = None
     # scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
     # model = torchDDP(model, device_ids=[args.rank])
@@ -321,8 +372,8 @@ def pacing_function(current_step, nbatch_per_epoch, training, args):
     
 def forward_step(data_iterator, model, mems, iteration, args):
     eval_cl_loss = (args.pacing_unit!='none') and not model.training
-    class_prediction = pacing_function(iteration, data_iterator.n_batch, model.training, args)
-    data, target, cl_data, cl_target = get_batch(data_iterator,iteration-args.restart_iteration)
+    class_prediction = pacing_function(iteration+args.restart_iteration, data_iterator.n_batch, model.training, args)
+    data, target, cl_data, cl_target = get_batch(data_iterator,iteration)
     root_mask = cl_target!=target
     input_root = args.input_root and class_prediction
     input_data = data
@@ -349,8 +400,8 @@ def forward_step(data_iterator, model, mems, iteration, args):
 def sega_forward_step(data_iterator, model, mems, iteration, args):
     mems, mems_pst = mems
     eval_cl_loss = (args.pacing_unit!='none') and not model.training
-    class_prediction = pacing_function(iteration, data_iterator.n_batch, model.training, args)
-    data, target, cl_data, cl_target, pst = get_batch_sega(data_iterator,iteration-args.restart_iteration,args.inner_start,args.inner_end)
+    class_prediction = pacing_function(iteration+args.restart_iteration, data_iterator.n_batch, model.training, args)
+    data, target, cl_data, cl_target, pst = get_batch_sega(data_iterator,iteration,args.inner_start,args.inner_end)
     root_mask = cl_target!=target
     input_root = args.input_root and class_prediction
     input_data = data
@@ -378,7 +429,11 @@ def sega_forward_step(data_iterator, model, mems, iteration, args):
     else:
         for t, m_t in zip(pst, mems_pst):
             cat = torch.cat([m_t, t], dim=0)
-            new_pst.append(cat[max(0, len(cat) - args.mem_len):])
+            if model.training:
+                m_len = model.module.mem_len
+            else:
+                m_len = model.mem_len
+            new_pst.append(cat[max(0, len(cat) - m_len):])
         mems_pst = tuple(new_pst)
     new_mems = [new_mems, mems_pst]
     cl_loss = lm_loss[root_mask]
@@ -390,11 +445,9 @@ def backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args):
         loss = 0.8*lm_loss + 0.2*auxiliary_loss
     else:
         loss = lm_loss
-    optimizer.zero_grad()
 
     if args.fp16:
-        with amp.scale_loss(loss, optimizer) as scaled_loss:
-            scaled_loss.backward()
+        optimizer.backward(loss)
     else:
         loss.backward()
 
@@ -403,31 +456,9 @@ def backward_step(optimizer, model, scaler, lm_loss, auxiliary_loss, args):
     else:
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
     return lm_loss, auxiliary_loss
-# def master_params(optimizer):
-#     """
-#     Generator expression that iterates over the params owned by ``optimizer``.
-
-#     Args:
-#         optimizer: An optimizer previously returned from ``amp.initialize``.
-#     """
-#     for group in optimizer.param_groups:
-#         for p in group['params']:
-#             yield p
-
-
-# def detect_nan_in_grad(optimizer):
-#     for model_grad in master_params(optimizer):
-#         cpu_sum = float(model_grad.float().sum())
-#         if cpu_sum == float('inf') or cpu_sum == -float('inf') or cpu_sum != cpu_sum:
-#             return True
-#     return False
 
 def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args):
-    if iteration-args.restart_iteration < args.warmup_step:
-        curr_lr = args.lr * (iteration-args.restart_iteration) / args.warmup_step
-        optimizer.param_groups[0]['lr'] = curr_lr
-    else:
-        lr_scheduler.step((iteration-args.restart_iteration))
+    model.zero_grad()
     inner_step = 0
     lm_loss_reduced = 0
     auxiliary_loss_reduced = 0
@@ -467,27 +498,13 @@ def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iter
         args.inner_start = None
         args.inner_end = None
     if is_nan_detected:
-        new_mems = reset_mems(args)
-        # if args.saved_nan == 0:
-        #     save_checkpoint(iteration, model, optimizer, lr_scheduler, args.work_dir, ckpt_folder_name=None)
-        #     mem_path = os.path.join(args.work_dir, 'iter_{:07d}'.format(iteration), 'mems.pt')
-        #     torch.save(mems, mem_path)
-        #     args.saved_nan = 1
+        # new_mems = reset_mems(args)
+        return -1,-1,-1,-1,-1
     else:
         new_mems = new_inner_mems
-    # if detect_nan_in_grad(optimizer):
-    #     print('nan grad detected, save checkpoints')
-    #     if args.continous_nan < 5:
-    #         optimizer.step()
-    #     else:
-    #         new_mems = reset_mems(args)
-    #         print('reset memory and skip the current step')
-    #     args.continous_nan +=1
-    # else:
-    #     args.continous_nan == 0
-    optimizer.step()
-
-
+        # if iteration!=0:
+        optimizer.step()
+    lr_scheduler.step(iteration+args.restart_iteration)
     return lm_loss_reduced, auxiliary_loss_reduced, cl_loss_reduced, non_cl_loss_reduced, new_mems
 
 def reset_mems(args):
@@ -502,6 +519,15 @@ def reset_mems(args):
     return mems
 
 def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, val_data_iterator, args):
+    try :
+        os.environ["SLURM_JOB_ID"]
+        use_cluster = True & args.auto_continue_slurm
+    except:
+        use_cluster = False
+
+    if use_cluster:
+        resume_command, death_time = slurm.restart_command()
+        print(resume_command)
     # Turn on training mode which enables dropout.
     # global train_step, train_loss, best_val_loss, eval_start_time, log_start_time
     model.train()
@@ -510,8 +536,11 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
     total_non_cl_lm_loss = 0.0
     total_auxiliary_loss = 0.0
     best_val_ppl = math.inf
+    if args.restart and os.path.exists(os.path.join(args.work_dir, 'best_ppl.txt')):
+        with open(os.path.join(args.work_dir, 'best_ppl.txt'), 'r') as f:
+            best_val_ppl = float(f.readline().strip())
     mems = reset_mems(args)
-    iteration = args.iteration
+    iteration = 0
     log_start_time = time.time()
     hypernym_grad = True
     cl_batch_size = False
@@ -522,7 +551,7 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
             args.max_step//train_data_iterator.n_batch*args.a)*train_data_iterator.n_batch
     else:
         cl_steps = 0
-    while iteration < args.max_step:
+    while (iteration+args.restart_iteration) < args.max_step:
         if args.dynamic_wn_layer_start_from >0:
             if iteration>=cl_steps:
                 continue
@@ -552,10 +581,12 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
                             device=device, ext_len=args.ext_len)
         if iteration % train_data_iterator.n_batch == 0:
             mems = reset_mems(args)
-            checkpoint_name = save_checkpoint(iteration, model, optimizer, lr_scheduler, args.work_dir, ckpt_folder_name='latest')
-            if args.gc_remote_path:
-                upload_model(checkpoint_name, args.gc_remote_path)
+
         lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = train_step(train_data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args)
+        if lm_loss==-1:
+            print('loss nan | Running restart command:', " ".join(resume_command))    
+            subprocess.check_call(resume_command)
+            return -1
         iteration += 1
         current_lm_loss = lm_loss.data.detach().float().item()
         total_lm_loss += current_lm_loss
@@ -571,7 +602,7 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
         log_dict = {"train/lr": learning_rate, "train/lm_loss": current_lm_loss, 
         "train/cl_lm_loss": current_cl_lm_loss, "train/non_cl_lm_loss": current_non_cl_lm_loss, 
         "train/auxiliary_loss":current_auxiliary_loss}
-        wandb.log(log_dict,step=iteration)
+        wandb.log(log_dict,step=iteration+args.restart_iteration)
         if iteration % args.log_interval == 0:
             elapsed = time.time() - log_start_time
             avg_lm_loss = total_lm_loss / args.log_interval
@@ -579,31 +610,61 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
             avg_non_cl_lm_loss = total_non_cl_lm_loss / args.log_interval
             avg_auxiliary_loss = total_auxiliary_loss / args.log_interval
 
-            epoch = iteration//train_data_iterator.n_batch
+            epoch = (iteration+args.restart_iteration)//train_data_iterator.n_batch
             log_str = '| epoch {:3d} step {:>8d} | ms/batch {:5.2f} |  lr {:.3g} | loss {:5.2f}'.format(
-                epoch, iteration, elapsed*1000/args.log_interval, learning_rate, avg_lm_loss)
+                epoch, iteration+args.restart_iteration, elapsed*1000/args.log_interval, learning_rate, avg_lm_loss)
             log_start_time = time.time()
             print(log_str)
             wandb.log({"train_avg/lm_loss": avg_lm_loss, "train_avg/cl_lm_loss":avg_cl_lm_loss,
-            "train_avg/non_cl_lm_loss":avg_non_cl_lm_loss, "train_avg/auxiliary_loss":avg_auxiliary_loss}, step=iteration)
+            "train_avg/non_cl_lm_loss":avg_non_cl_lm_loss, "train_avg/auxiliary_loss":avg_auxiliary_loss}, step=iteration+args.restart_iteration)
             total_lm_loss = 0
             total_cl_lm_loss = 0
             total_non_cl_lm_loss = 0
             total_auxiliary_loss = 0
-        if iteration % args.save_interval == 0 :
-            save_checkpoint(iteration, model, optimizer, lr_scheduler, args.work_dir, ckpt_folder_name=None)
         if iteration % args.eval_interval == 0:
             val_lm_ppl = None
-            val_lm_ppl = evaluate_and_print_results(val_data_iterator, model,args, iteration)
+            val_lm_ppl = evaluate_and_print_results(val_data_iterator, model,args, iteration+args.restart_iteration)
+            with open(os.path.join(args.work_dir, 'model.pt'), 'wb') as f:
+                torch.save(model.module, f)
+                if args.gc_remote_path:
+                    upload_model(os.path.join(args.work_dir, 'model.pt'), args.gc_remote_path)
+            with open(os.path.join(args.work_dir, 'optimizer.pt'), 'wb') as f:
+                torch.save(optimizer.state_dict(), f)
+                if args.gc_remote_path:
+                    upload_model(os.path.join(args.work_dir, 'optimizer.pt'), args.gc_remote_path)
+            with open(os.path.join(args.work_dir, 'iteration.txt'), 'w') as f:
+                f.write(str(iteration+args.restart_iteration))
             if val_lm_ppl < best_val_ppl:
-                save_checkpoint(iteration, model, optimizer, lr_scheduler, args.work_dir, ckpt_folder_name='best')
+                with open(os.path.join(args.work_dir, 'best_model.pt'), 'wb') as f:
+                    torch.save(model.module, f)
+                    if args.gc_remote_path:
+                        upload_model(os.path.join(args.work_dir, 'best_model.pt'), args.gc_remote_path)
+                with open(os.path.join(args.work_dir, 'best_optimizer.pt'), 'wb') as f:
+                    torch.save(optimizer.state_dict(), f)
+                    if args.gc_remote_path:
+                        upload_model(os.path.join(args.work_dir, 'best_optimizer.pt'), args.gc_remote_path)
+                with open(os.path.join(args.work_dir, 'best_iteration.txt'), 'w') as f:
+                    f.write(str(iteration+args.restart_iteration))
+                with open(os.path.join(args.work_dir, 'best_ppl.txt'), 'w') as f:
+                    f.write(str(val_lm_ppl))
                 best_val_ppl = val_lm_ppl
-
+            if use_cluster:
+                done = (death_time is not None and
+                        death_time - time.time() < MAXIMUM_SAVE_TIME)      
+            else:
+                done = False
+                
+            if done and ((iteration+args.restart_iteration)<args.max_step):
+                print("time left:", str(death_time - time.time()))
+                print('| Running restart command:', " ".join(resume_command))    
+                subprocess.check_call(resume_command)
+                return -1
     return iteration
 
 def evaluate(data_iterator, model, args):
     # If the model does not use memory at all, make the ext_len longer.
     # Otherwise, make the mem_len longer and keep the ext_len the same.
+    tokenize = MosesTokenizer('en')
     while isinstance(model, (nn.DataParallel)):
         model = model.module
     model.eval()
@@ -632,16 +693,36 @@ def evaluate(data_iterator, model, args):
             else:
                 lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = forward_step(data_iterator, model, mems, iteration, args)
 
-            seq_len = lm_loss.size()[0]
-            total_lm_len += seq_len
-            total_lm_loss += lm_loss.mean().float().item()*seq_len
-            cl_seq_len = torch.numel(cl_loss)/data_iterator.bsz
-            total_cl_len += cl_seq_len
-            total_cl_loss += cl_loss.mean().float().item()*cl_seq_len
-            total_auxiliary_loss += auxiliary_loss.mean().float().item()*cl_seq_len
-            non_cl_seq_len = seq_len-cl_seq_len
-            total_non_cl_len += non_cl_seq_len
-            total_non_cl_loss += non_cl_loss.mean().float().item()*non_cl_seq_len
+
+            if args.bpe and args.sega:
+                data, target, cl_data, cl_target, pst = get_batch_sega(data_iterator,iteration)
+                try:
+                    word_count = len(tokenize(''.join(args.tokenizer(target.view(-1).tolist())).replace("▁"," ").replace("\n"," ")))
+                except:
+                    print('mosetokenizer failed')
+                    word_count = len(''.join(args.tokenizer(target.view(-1).tolist())).split('▁'))
+                seq_len = word_count/data_iterator.bsz
+                total_lm_len += seq_len
+                total_lm_loss += lm_loss.sum().float().item()/data_iterator.bsz
+                cl_seq_len = torch.numel(cl_loss)/data_iterator.bsz
+                total_cl_len += cl_seq_len
+                total_cl_loss += cl_loss.sum().float().item()/data_iterator.bsz
+                total_auxiliary_loss += auxiliary_loss.mean().float().item()*cl_seq_len
+                non_cl_seq_len = seq_len-cl_seq_len
+                total_non_cl_len += non_cl_seq_len
+                total_non_cl_loss += non_cl_loss.sum().float().item()/data_iterator.bsz
+            else:
+                seq_len = lm_loss.size()[0]
+                total_lm_len += seq_len
+                total_lm_loss += lm_loss.mean().float().item()*seq_len
+
+                cl_seq_len = torch.numel(cl_loss)/data_iterator.bsz
+                total_cl_len += cl_seq_len
+                total_cl_loss += cl_loss.mean().float().item()*cl_seq_len
+                total_auxiliary_loss += auxiliary_loss.mean().float().item()*cl_seq_len
+                non_cl_seq_len = seq_len-cl_seq_len
+                total_non_cl_len += non_cl_seq_len
+                total_non_cl_loss += non_cl_loss.mean().float().item()*non_cl_seq_len
 
             
     # Switch back to the training mode
@@ -767,11 +848,7 @@ def get_gt_rank_and_prob(model, va_iter,cl_all_leaf_sym, class2words, word2class
 
 def main():
     args = get_args()
-    if torch.cuda.device_count()==4 and args.do_train and args.model_size=='large':
-        args.accumulation_steps = 2
-        args.gpu0_bsz = args.gpu0_bsz//2
-    else:
-        args.accumulation_steps = 1
+    args.gpu0_bsz = args.gpu0_bsz//args.accumulation_steps
     args.inner_start = None
     args.inner_end = None
     args.saved_nan = 0
@@ -790,20 +867,26 @@ def main():
         device=device, ext_len=args.ext_len)
     va_iter = corpus.get_iterator('valid', args.eval_batch_size, args.eval_tgt_len,
         device=device, ext_len=args.ext_len)
-    te_iter = corpus.get_iterator('test', args.eval_batch_size, args.eval_tgt_len,
+    te_iter = corpus.get_iterator('test', 1, args.eval_tgt_len,
         device=device, ext_len=args.ext_len)
-
+    if args.bpe and args.sega:
+        args.tokenizer = corpus.vocab.get_symbols
     if args.do_train:
-        train(model, optimizer, scheduler, scaler, corpus, tr_iter, va_iter, args)
-    if args.do_eval and args.load_checkpoint:
-        evaluate_and_print_results(va_iter, model, args, iteration=args.iteration)
+        rt = train(model, optimizer, scheduler, scaler, corpus, tr_iter, va_iter, args)
+        if rt == -1:
+            return
+    if args.do_eval:
+        va_iter = corpus.get_iterator('valid', 1, args.eval_tgt_len,
+        device=device, ext_len=args.ext_len)
+        local_path = os.path.join(args.work_dir, "best_model.pt")
+        with open(local_path, 'rb') as f:
+            model = torch.load(f).to(device)
+        evaluate_and_print_results(va_iter, model, args, iteration=-1)
     if args.do_test:
-        checkpoint_name = ""
-        if args.checkpoint_dir:
-            checkpoint_name = os.path.join(args.checkpoint_dir,'best/model_optim_rng.pt')
-        iteration = load_checkpoint(model, None, None, args, ckpt_folder_name='best', checkpoint_name=checkpoint_name)
-
-        test(te_iter, model, args, iteration=iteration)
+        local_path = os.path.join(args.work_dir, "best_model.pt")
+        with open(local_path, 'rb') as f:
+            model = torch.load(f).to(device)
+        test(te_iter, model, args, iteration=-1)
 
 if __name__ == "__main__":
     main()

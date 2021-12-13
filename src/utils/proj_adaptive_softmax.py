@@ -383,6 +383,7 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                 self.register_buffer('remove_leaf_{}'.format(i), torch.zeros(cur_length).index_fill_(0, torch.tensor(leaf_index),float("inf")))
                 self.register_buffer('remove_root_and_leaf_{}'.format(i), torch.zeros(cur_length).index_fill_(0, torch.tensor(root_index+leaf_index),float("inf")))
         else:
+            i=0
             self.register_buffer('remove_root_{}'.format(i), torch.zeros(n_token).index_fill_(0, torch.tensor(cl_all_root_index),float("inf")))
             self.register_buffer('remove_leaf_{}'.format(i), torch.zeros(n_token).index_fill_(0, torch.tensor(cl_all_leaf_index),float("inf")))
             self.register_buffer('remove_root_and_leaf_{}'.format(i), torch.zeros(n_token).index_fill_(0, torch.tensor(cl_all_root_index+cl_all_leaf_index),float("inf")))

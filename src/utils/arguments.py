@@ -418,7 +418,7 @@ def get_args():
         # this hack is required to enable `pt monitor` *while the job is running*.
         delattr(tf.io.gfile.LocalFileSystem, 'append')
         # args.work_dir = os.environ.get('PT_OUTPUT_DIR', '.')
-        args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d'))
+        args.restart_dir = args.word_dir
     else:
         args.work_dir = os.path.join(args.work_dir)
         os.makedirs(args.work_dir, exist_ok=True)

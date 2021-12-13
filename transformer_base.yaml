@@ -13,6 +13,7 @@ environment:
   setup:
     - export MKL_SERVICE_FORCE_INTEL=1 
     - python -m nltk.downloader punkt wordnet
+    - pip install tokenizers mosestokenizer
     
 code:
   local_dir: $CONFIG_DIR/src
@@ -21,38 +22,49 @@ data:
   local_dir: $CONFIG_DIR/data/wikitext-103
   remote_dir: data/wikitext-103
 
-# list of jobs to run, we run 2 jobs in this example
-# For large model, the minimum GPU configuration is a 8*32GB single node.
+# work_dir is used for model saving and loading
+# job name
 jobs:
 - name: train_large_segaxl_hp
-  sku: G8
+  sku: G4
   command:
   - python train.py 
-    --job_name train_large_segaxl_hp
-    --pacing_function step
-    --pacing_unit step
-    --a 0.12
-    --b 0.8
-    --wn_layer 5
-    --mix_vocab
-    --input_root
-    --max_step 400000
-    --batch_size 128
-    --gpu0_bsz 8
-    --mem_len 384
-    --sega
-    --model_size large
-    --dataset wt103
-    --adaptive
-    --fp16
-    --dynamic-loss-scale
-    --multi_gpu
-    --cuda
-    --pt
-    --do_train
-    --do_test
-    --load_checkpoint latest 
-    --work_dir ${A_PATH}
+    --job_name train_large_segaxl_hp \
+    --clip 0.1 \
+    --lr 0.0001 \
+    --warmup_step 16000 \
+    --optim nag \
+    --mom 0.99 \
+    --lr_min 1e-09 \
+    --lr_max 1.0 \
+    --t_mult 2 \
+    --warmup_init_lr 1e-07 \
+    --lr_shrink 0.75 \
+    --dataset wt103 \
+    -batch_size 128 \
+    --sega \
+    --pacing_function step \
+    --pacing_unit step \
+    --a 0.12 \
+    --b 0.8 \
+    --gpu0_bsz 20 \
+    --accumulation_steps 2 \
+    --model_size large \
+    --max_step 4000000 \
+    --mix_vocab \
+    --adaptive \
+    --fp16 \
+    --dynamic-loss-scale \
+    --multi_gpu \
+    --input_root \
+    --cuda \
+    --do_train \
+    --do_eval \
+    --do_test \
+    --div_val 4 \
+    --restart \
+    --pt \
+    --work_dir ${dirpath_for_model_saving_and_reloading}
 
 search:
   job_template:

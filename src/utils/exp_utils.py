@@ -54,6 +54,7 @@ class CosineAnnealingLR(_LRScheduler):
     """
 
     def __init__(self, optimizer, args, last_epoch=-1, verbose=False):
+        self.args = args
         self.T_max = args.max_step
         self.min_lr = args.lr_min
         self.max_lr = args.lr_max
@@ -66,12 +67,11 @@ class CosineAnnealingLR(_LRScheduler):
             self.lr_step = (warmup_end_lr - args.warmup_init_lr) / args.warmup_step
         else:
             self.lr_step = 1
-
         super(CosineAnnealingLR, self).__init__(optimizer, last_epoch, verbose)
 
     def get_lr(self):
         if self.last_epoch<self.args.warmup_step:
-            return  self.args.warmup_init_lr + self.last_epoch * self.lr_step
+            return  [self.args.warmup_init_lr + self.last_epoch * self.lr_step]
         else:
             curr_updates = self.last_epoch - self.args.warmup_step
             if self.t_mult != 1:
@@ -87,11 +87,11 @@ class CosineAnnealingLR(_LRScheduler):
             max_lr = self.max_lr * lr_shrink
 
             lr = min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * t_curr / t_i))
-            return lr
+            return [lr]
 
     def _get_closed_form_lr(self):
         if self.last_epoch<self.args.warmup_step:
-            return self.args.warmup_init_lr + self.last_epoch * self.lr_step
+            return [self.args.warmup_init_lr + self.last_epoch * self.lr_step]
         else:
             curr_updates = self.last_epoch - self.args.warmup_step
             if self.t_mult != 1:
@@ -107,7 +107,7 @@ class CosineAnnealingLR(_LRScheduler):
             max_lr = self.max_lr * lr_shrink
 
             lr = min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * t_curr / t_i))
-            return lr
+            return [lr]
 
 
 def upload_model(local_path, remote_path):

@@ -13,6 +13,7 @@ from mpu.random import get_cuda_rng_tracker
 # import mpu
 from torch.optim.lr_scheduler import _LRScheduler
 import math
+
 class CosineAnnealingLR(_LRScheduler):
     r"""Set the learning rate of each parameter group using a cosine annealing
     schedule, where :math:`\eta_{max}` is set to the initial lr and
@@ -56,18 +57,22 @@ class CosineAnnealingLR(_LRScheduler):
     def __init__(self, optimizer, args, last_epoch=-1, verbose=False):
         self.args = args
         self.T_max = args.max_step
-        self.min_lr = args.lr_min
+        self.min_lr = args.lr
         self.max_lr = args.lr_max
         self.t_mult = args.t_mult
-        self.period = args.max_step- args.warmup_step
+        self.period = args.lr_period_updates
+
+        if self.period <= 0:
+            self.period = args.max_step - args.warmup_step
         self.lr_shrink = args.lr_shrink
-        warmup_end_lr = args.lr_max
+        warmup_end_lr = args.lr_max 
         if args.warmup_step > 0:
             # linearly warmup for the first args.warmup_step
             self.lr_step = (warmup_end_lr - args.warmup_init_lr) / args.warmup_step
         else:
             self.lr_step = 1
         super(CosineAnnealingLR, self).__init__(optimizer, last_epoch, verbose)
+        optimizer.param_groups[0]['lr'] = args.warmup_init_lr
 
     def get_lr(self):
         if self.last_epoch<self.args.warmup_step:
@@ -293,7 +298,7 @@ def print_rank_0(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
-
+        
 def logging(s, log_path, print_=True, log_=True):
     if print_:
         print(s)

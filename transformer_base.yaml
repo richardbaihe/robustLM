@@ -33,6 +33,7 @@ jobs:
     --clip 0.25 \
     --lr 0.0001 \
     --warmup_step 16000 \
+    --lr_period_updates 270000 \
     --optim adam \
     --lr_min 1e-09 \
     --lr_max 0.0002 \

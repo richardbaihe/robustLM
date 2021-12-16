@@ -584,8 +584,7 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
 
         lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = train_step(train_data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args)
         if lm_loss==-1:
-            print('loss nan | Running restart command:', " ".join(resume_command))    
-            subprocess.check_call(resume_command)
+            print('loss nan')
             return -1
         iteration += 1
         current_lm_loss = lm_loss.data.detach().float().item()

@@ -30,13 +30,12 @@ jobs:
   command:
   - python train.py 
     --job_name train_large_segaxl_hp \
-    --clip 0.1 \
+    --clip 0.25 \
     --lr 0.0001 \
     --warmup_step 16000 \
-    --optim nag \
-    --mom 0.99 \
+    --optim adam \
     --lr_min 1e-09 \
-    --lr_max 0.5 \
+    --lr_max 0.0002 \
     --t_mult 2 \
     --warmup_init_lr 1e-07 \
     --lr_shrink 0.75 \

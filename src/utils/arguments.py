@@ -196,6 +196,7 @@ def add_training_config_args(parser, is_sagemaker=False):
                         help='minimum learning rate during annealing')
     group.add_argument('--lr_max', type=float, default=1.0,
                         help='minimum learning rate during annealing')
+    group.add_argument('--lr_period_updates', type=int, default=270000, help='upper epoch limit')
     group.add_argument('--clip', type=float, default=0.25,
                         help='gradient clipping')
     group.add_argument('--max_step', type=int, default=100000,

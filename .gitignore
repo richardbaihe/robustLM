@@ -42,3 +42,8 @@ Docker*
 setup.py
 gc_config.yaml
 brown-cluster/
+src/log/*
+launch.json
+CC_scripts/*
+codes_submission/*
+codes.zip

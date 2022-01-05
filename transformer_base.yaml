@@ -33,15 +33,15 @@ jobs:
     --clip 0.25 \
     --lr 0.0001 \
     --warmup_step 16000 \
-    --lr_period_updates 270000 \
+    --lr_period_updates 200000 \
     --optim adam \
     --lr_min 1e-09 \
-    --lr_max 0.0002 \
+    --lr_max 0.00025 \
     --t_mult 2 \
     --warmup_init_lr 1e-07 \
     --lr_shrink 0.75 \
     --dataset wt103 \
-    -batch_size 128 \
+    --batch_size 128 \
     --sega \
     --pacing_function step \
     --pacing_unit step \
@@ -50,7 +50,7 @@ jobs:
     --gpu0_bsz 20 \
     --accumulation_steps 2 \
     --model_size large \
-    --max_step 4000000 \
+    --max_step 400000 \
     --mix_vocab \
     --adaptive \
     --fp16 \
@@ -63,6 +63,10 @@ jobs:
     --do_test \
     --div_val 4 \
     --restart \
+    --mem_len 384 \
+    --tgt_len 384 \
+    --eval_tgt_len 384 \
+    --eval_interval 4000 \
     --pt \
     --work_dir ${dirpath_for_model_saving_and_reloading}
 

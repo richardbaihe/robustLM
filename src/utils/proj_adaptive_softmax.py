@@ -379,14 +379,21 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                         for index in self.cl_all_leaf_index
                         if index < r_idx and index >= l_idx
                     ]
-                self.register_buffer('remove_root_{}'.format(i), torch.zeros(cur_length).index_fill_(0, torch.tensor(root_index),float("inf")))
-                self.register_buffer('remove_leaf_{}'.format(i), torch.zeros(cur_length).index_fill_(0, torch.tensor(leaf_index),float("inf")))
-                self.register_buffer('remove_root_and_leaf_{}'.format(i), torch.zeros(cur_length).index_fill_(0, torch.tensor(root_index+leaf_index),float("inf")))
+                # self.register_buffer('remove_root_{}'.format(i), torch.zeros(cur_length).index_fill_(0, torch.tensor(root_index),float("inf")))
+                # self.register_buffer('remove_leaf_{}'.format(i), torch.zeros(cur_length).index_fill_(0, torch.tensor(leaf_index),float("inf")))
+                # self.register_buffer('remove_root_and_leaf_{}'.format(i), torch.zeros(cur_length).index_fill_(0, torch.tensor(root_index+leaf_index),float("inf")))
+                self.register_buffer('remove_root_{}'.format(i), torch.ones(cur_length).index_fill_(0, torch.tensor(root_index),float(0)))
+                self.register_buffer('remove_leaf_{}'.format(i), torch.ones(cur_length).index_fill_(0, torch.tensor(leaf_index),float(0)))
+                self.register_buffer('remove_root_and_leaf_{}'.format(i), torch.ones(cur_length).index_fill_(0, torch.tensor(root_index+leaf_index),float(0)))
         else:
             i=0
-            self.register_buffer('remove_root_{}'.format(i), torch.zeros(n_token).index_fill_(0, torch.tensor(cl_all_root_index),float("inf")))
-            self.register_buffer('remove_leaf_{}'.format(i), torch.zeros(n_token).index_fill_(0, torch.tensor(cl_all_leaf_index),float("inf")))
-            self.register_buffer('remove_root_and_leaf_{}'.format(i), torch.zeros(n_token).index_fill_(0, torch.tensor(cl_all_root_index+cl_all_leaf_index),float("inf")))
+            # self.register_buffer('remove_root_{}'.format(i), torch.zeros(n_token).index_fill_(0, torch.tensor(cl_all_root_index),float("inf")))
+            # self.register_buffer('remove_leaf_{}'.format(i), torch.zeros(n_token).index_fill_(0, torch.tensor(cl_all_leaf_index),float("inf")))
+            # self.register_buffer('remove_root_and_leaf_{}'.format(i), torch.zeros(n_token).index_fill_(0, torch.tensor(cl_all_root_index+cl_all_leaf_index),float("inf")))
+            self.register_buffer('remove_root_{}'.format(i), torch.ones(n_token).index_fill_(0, torch.tensor(cl_all_root_index),float(0)))
+            self.register_buffer('remove_leaf_{}'.format(i), torch.ones(n_token).index_fill_(0, torch.tensor(cl_all_leaf_index),float(0)))
+            self.register_buffer('remove_root_and_leaf_{}'.format(i), torch.ones(n_token).index_fill_(0, torch.tensor(cl_all_root_index+cl_all_leaf_index),0))
+
 
         self.out_layers = nn.ModuleList()
         self.proj_flag = False
@@ -441,11 +448,14 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
         if self.n_clusters == 0:
             logit = self.out_layers[0](hidden)
             if predict_root:
-                logit = logit - getattr(self, 'remove_leaf_{}'.format(0))
+                # logit = logit - getattr(self, 'remove_leaf_{}'.format(0))
+                logit = logit + (getattr(self, 'remove_leaf_{}'.format(0)) + 1e-45).log()
             else:
-                logit = logit - getattr(self, 'remove_root_{}'.format(0))
+                # logit = logit - getattr(self, 'remove_root_{}'.format(0))
+                logit = logit + (getattr(self, 'remove_root_{}'.format(0)) + 1e-45).log()
             if general_words_only:
-                logit = logit - getattr(self, 'remove_root_and_leaf_{}'.format(0))
+                # logit = logit - getattr(self, 'remove_root_and_leaf_{}'.format(0))
+                logit = logit + (getattr(self, 'remove_root_and_leaf_{}'.format(0)) + 1e-45).log()
 
             nll = (
                 -F.log_softmax(logit, dim=-1).gather(1, target.unsqueeze(1)).squeeze(1)
@@ -478,12 +488,15 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
 
             head_logit = self._compute_logit(hidden, head_weight, head_bias, head_proj)
             if predict_root:
-                head_logit = head_logit-getattr(self, 'remove_leaf_{}'.format(0))
+                # head_logit = head_logit - getattr(self, 'remove_leaf_{}'.format(0))
+                head_logit = head_logit + (getattr(self, 'remove_leaf_{}'.format(0)) + 1e-45).log()
             else:
-                head_logit = head_logit-getattr(self, 'remove_root_{}'.format(0))
-
+                # head_logit = head_logit - getattr(self, 'remove_root_{}'.format(0))
+                head_logit = head_logit + (getattr(self, 'remove_root_{}'.format(0)) + 1e-45).log()
             if general_words_only:
-                head_logit = head_logit-getattr(self, 'remove_root_and_leaf_{}'.format(0))
+                # head_logit = head_logit - getattr(self, 'remove_root_and_leaf_{}'.format(0))
+                head_logit = head_logit + (getattr(self, 'remove_root_and_leaf_{}'.format(0)) + 1e-45).log()
+
             # head_logit[:,0] = -float('inf')
 
 
@@ -515,16 +528,17 @@ class ClassedProjectedAdaptiveLogSoftmax(nn.Module):
                         hidden_i, weight_i, bias_i, proj_i
                     )
                     if predict_root:
-                        tail_logit_i -= getattr(self, 'remove_leaf_{}'.format(i))
+                        # tail_logit_i -= getattr(self, 'remove_leaf_{}'.format(i))
+                        tail_logit_i = tail_logit_i + (getattr(self, 'remove_leaf_{}'.format(i)) + 1e-45).log()
                     else:
-                        tail_logit_i -= getattr(self, 'remove_root_{}'.format(i))
+                        # tail_logit_i -= getattr(self, 'remove_root_{}'.format(i))
+                        tail_logit_i = tail_logit_i + (getattr(self, 'remove_root_{}'.format(i)) + 1e-45).log()
                     if general_words_only:
-                        tail_logit_i -= getattr(self, 'remove_root_and_leaf_{}'.format(i))
-                    # tail_logprob_i = F.log_softmax(tail_logit_i, dim=1)
+                        # tail_logit_i -= getattr(self, 'remove_root_and_leaf_{}'.format(i))
+                        tail_logit_i = tail_logit_i + (getattr(self, 'remove_root_and_leaf_{}'.format(i)) + 1e-45).log()
+
                     logprob_i = self.nll_loss(tail_logit_i.float(), target_i) - head_logprob_i[:, -i]
-                    # logprob_i = head_logprob_i[:, -i] + tail_logprob_i.gather(
-                    #     1, target_i[:, None]
-                    # ).squeeze(1)
+
 
                 if (hasattr(self, "keep_order") and self.keep_order) or keep_order:
                     nll.index_copy_(0, indices_i, logprob_i)

@@ -311,8 +311,9 @@ def setup_model_and_optimizer(args):
         else:
             print('Optimizer was not saved. Start from scratch.')
         try:
-            with open(os.path.join(args.work_dir,'iteration.txt'),'r') as f:
+            with open(os.path.join(args.restart_dir,'iteration.txt'),'r') as f:
                 args.restart_iteration = int(f.readline().strip())
+                print('loading checkpoints from iteration {}.'.format(args.restart_iteration))
         except:
             args.restart_iteration = 0
         # args.warmup_step = args.warmup_step-args.restart_iteration
@@ -413,6 +414,19 @@ def sega_forward_step(data_iterator, model, mems, iteration, args):
     ret = model(input_data, target, cl_target, mems, pst, mems_pst, args,
                         class_prediction=class_prediction, hypernym_input=hypernym_input)
     lm_loss, auxiliary_loss, new_mems = ret[0], ret[1], ret[2:]
+    if torch.isnan(lm_loss).sum().item() != 0:
+        print('{} loss nan, reset mem'.format(iteration))
+        os.makedirs(os.path.join(args.work_dir, 'nan'),exist_ok=True)
+        with open(os.path.join(args.work_dir, 'nan', 'model.pt'), 'wb') as f:
+            torch.save(model.module, f)
+        with open(os.path.join(args.work_dir,'nan', 'input.pt'), 'wb') as f:
+            model.eval()
+            eval_ret =  model(input_data, target, cl_target, mems, pst, mems_pst, args,
+                        class_prediction=class_prediction, hypernym_input=hypernym_input)
+            input_data = {'data':data, "target":target,"cl_data":cl_data,"cl_target":cl_target, "pst":pst, 'mems':mems,"mems_pst":mems_pst,"loss":lm_loss,'eval_loss':eval_ret[0]}
+            torch.save(input_data, f)
+        with open(os.path.join(args.work_dir,'nan', 'iteration.txt'), 'w') as f:
+            f.write(str(iteration))
     if args.fp16:
         new_mems = [x.half() for x in new_mems]
     if eval_cl_loss:
@@ -504,7 +518,7 @@ def train_step(data_iterator, mems, model, optimizer, lr_scheduler, scaler, iter
         new_mems = new_inner_mems
         # if iteration!=0:
         optimizer.step()
-    lr_scheduler.step(iteration+args.restart_iteration)
+    lr_scheduler.step(iteration)
     return lm_loss_reduced, auxiliary_loss_reduced, cl_loss_reduced, non_cl_loss_reduced, new_mems
 
 def reset_mems(args):
@@ -579,10 +593,10 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
                 device = torch.device('cuda' if args.cuda else 'cpu')
                 train_data_iterator = corpus.get_iterator('train', args.batch_size, args.tgt_len,
                             device=device, ext_len=args.ext_len)
-        if iteration % train_data_iterator.n_batch == 0:
+        if (iteration+args.restart_iteration) % train_data_iterator.n_batch == 0:
             mems = reset_mems(args)
 
-        lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = train_step(train_data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration, args)
+        lm_loss, auxiliary_loss, cl_loss, non_cl_loss, mems = train_step(train_data_iterator, mems, model, optimizer, lr_scheduler, scaler, iteration+args.restart_iteration, args)
         if lm_loss==-1:
             print('loss nan')
             return -1
@@ -623,6 +637,15 @@ def train(model, optimizer, lr_scheduler,scaler, corpus, train_data_iterator, va
         if iteration % args.eval_interval == 0:
             val_lm_ppl = None
             val_lm_ppl = evaluate_and_print_results(val_data_iterator, model,args, iteration+args.restart_iteration)
+            if iteration % (args.eval_interval*3) == 0: 
+                os.makedirs(os.path.join(args.work_dir, str(iteration+args.restart_iteration)), exist_ok=True)
+                with open(os.path.join(args.work_dir, str(iteration+args.restart_iteration),'model.pt'), 'wb') as f:
+                    torch.save(model.module, f)
+                with open(os.path.join(args.work_dir, str(iteration+args.restart_iteration),'optimizer.pt'), 'wb') as f:
+                    torch.save(optimizer.state_dict(), f)
+                with open(os.path.join(args.work_dir, str(iteration+args.restart_iteration), 'iteration.txt'), 'w') as f:
+                    f.write(str(iteration+args.restart_iteration))
+
             with open(os.path.join(args.work_dir, 'model.pt'), 'wb') as f:
                 torch.save(model.module, f)
                 if args.gc_remote_path:

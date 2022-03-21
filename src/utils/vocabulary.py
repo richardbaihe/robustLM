@@ -4,6 +4,7 @@ from collections import Counter, OrderedDict, defaultdict
 import torch
 import nltk
 from nltk.corpus import wordnet as wn
+from tokenizers import Tokenizer
 
 class Vocab(object):
     def __init__(self, special=[], min_freq=1, max_size=None, lower_case=True,
@@ -355,7 +356,6 @@ class Vocab(object):
     def __len__(self):
         return len(self.idx2sym)
 
-
 class SegaVocab(Vocab):
     def __init__(self, special=[], min_freq=0, max_size=None, lower_case=True,
                  delimiter=None, vocab_file=None):
@@ -471,3 +471,91 @@ class SegaVocab(Vocab):
             t = torch.cat(t)
 
         return (encoded, p, s, t), encoded_cl
+
+class SegaBPEVocab(SegaVocab):
+    def __init__(self, special=[], min_freq=1, max_size=None, lower_case=True,
+                 delimiter=None, vocab_file=None, tokenizer_path=None):
+        self.counter = Counter()
+        self.special = special
+        self.min_freq = min_freq
+        self.max_size = max_size
+        self.lower_case = lower_case
+        self.delimiter = delimiter
+        self.vocab_file = vocab_file
+        self.cl_root_tokens = []
+        self.cl_leaf_tokens = []
+        self.word2class = {}
+        self.class2words = defaultdict(list)
+        self.word2class_dict = defaultdict(dict)
+        self.tokenizer = Tokenizer.from_file(tokenizer_path)
+        self.tokenizer.add_special_tokens(self.special)
+        self.unk_idx = self.tokenizer.get_vocab()['<unk>']
+
+    def tokenize(self, line, add_eos=False, add_double_eos=False, add_sent_eos=False, char_level=False):
+        line = line.strip()
+        if char_level:
+            line = ' '.join([str(ord(c)) for c in line])
+        # convert to lower case
+        if self.lower_case:
+            line = line.lower()
+        
+        symbols = self.tokenizer.encode(
+                    line).tokens
+        if add_sent_eos:
+            symbols = symbols + ['<sent_eos>']
+        if add_double_eos:  # lm1b
+            return ['<S>'] + symbols + ['<S>']
+        elif add_eos:
+            return symbols + ['<eos>']
+        else:
+            return symbols
+
+    def get_wn_replaced_dict(self, synset_layer=5, ignore_freqency_threshold=3000, replaced_with_new_symbol=True,
+                             min_tokens_per_hypernym=0):
+        
+        word2class = {}
+        class2words = defaultdict(list)
+        for k_ori, cnt in self.counter.most_common(self.max_size):
+            if cnt >= ignore_freqency_threshold:
+                continue
+            if cnt < self.min_freq:
+                break
+            if '▁' not in k_ori:
+                continue
+            else:
+                k = k_ori.strip('▁')
+            continue_for_k = True
+            for synset in wn.synsets(k):
+                paths = synset.hypernym_paths()
+                for path in paths:
+                    if len(path) < synset_layer+1:
+                        continue
+                    else:
+                        hypernym_name = path[synset_layer].name()
+                        if '.n.' not in hypernym_name:
+                            continue
+                        if not replaced_with_new_symbol:
+                            hypernym_name = hypernym_name.split('.')[0].split('')
+                        class2words[path[synset_layer].name()].append(
+                            k_ori)
+                        word2class[k_ori] = path[synset_layer].name()
+                        # self.counter.update([path[synset_layer].name()]*cnt)
+                        self.counter.update([path[synset_layer].name()])
+                        continue_for_k = False
+                        break
+                if not continue_for_k:
+                    break
+        for k, v in class2words.items():
+            if len(v) >= min_tokens_per_hypernym:
+                self.class2words[k].extend(v)
+                for token in v:
+                    self.word2class[token] = k
+            else:
+                self.counter[k]=0
+        for k, v in self.class2words.items():
+            self.cl_root_tokens.append(k)
+            self.cl_leaf_tokens.extend(v)
+        self.cl_leaf_tokens = list(set(self.cl_leaf_tokens))
+        self.tokenizer.add_special_tokens(self.cl_root_tokens)
+        # self.vocab.cl_root_tokens = list(self.vocab.class2words.keys())
+        # self.vocab.cl_leaf_tokens = list(self.vocab.word2class.keys())

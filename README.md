@@ -1,30 +1,31 @@
-# Notes for submitting jobs with PhillyTool(Amulet)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-The main function is located in `src/train.py`
+This repo contains codes of our paper 
 
-The yaml file of Amulet is located in `./transformer_base.yaml`
+> [Better Language Model with Hypernym Class Prediction ](https://arxiv.org/)
+>
+> He Bai, Tong Wang, Alessandro Sordoni, Peng Shi
+>
+> ACL 2022
 
-## 1. Config PhillyTool(Amulet)
 
-config `project_name`, `storage_account_name`, `local_path`, and `default_output_dir `in `.ptconfig` or `.amltconfig`
+# 0. Docker Env setup
+If you are not using Docker, please make sure your pytorch and cuda version is as same as our `Dockerfile` and also install the python packages listed in `Dockerfile`
 
-## 2. Config wandb
+# 1. Data Preparison
+Run `.get_data.sh` to download and unzip wikitext-103 dataset automatically.
 
-Currently, we are monitoring jobs with https://wandb.ai/home. If you don't use it, send an argument `--wandb_offline` to `train.py`.
+Download Arixv dataset manually following this [link](https://github.com/deepmind/deepmind-research/tree/master/pitfalls_static_language_models).
+`arxiv_data.py` is a script for data spliting.
 
-To login wandb on remote clusters, a json file `src/wandb_config.json` should be added and configed.
 
-```json
-{
-  "WANDB_API_KEY": "apikey",
-  "WANDB_ENTITY": "username", 
-  "WANDB_PROJECT": "projectname"
-}
-```
+# 2.Traning
+We list all training commands in `train.sh` file.
 
-## 3. Data preparation
+For large model, 8\*32GB GPU memorys are required or using 4\*40GB with `accumulation steps =2`.
 
-run `.get_data.sh`, which would create a folder named data and download, unzip, and re-name files of wikitext-103 to this folder.
+For base model and small model, 4*32GB gpus is enough.
 
-Then upload data to azure with pt/amlt command `pt/amlt upload --config-file transformer_base.yaml`
-
+# 3. Testing
+The training command above could test the best valid model after training automatically.
+If you would test by yourself, comment the argument "--do_train" can skip training stage and do evaluation and test directly.

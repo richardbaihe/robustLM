@@ -5,7 +5,7 @@ from collections import Counter, OrderedDict, defaultdict
 import numpy as np
 import torch
 
-from utils.vocabulary import Vocab, SegaVocab
+from utils.vocabulary import Vocab, SegaVocab, SegaBPEVocab
 
 
 class LMOrderedIterator(object):
@@ -40,7 +40,7 @@ class LMOrderedIterator(object):
     def get_batch(self, i, bptt=None):
         if bptt is None:
             bptt = self.bptt
-        seq_len = min(bptt, self.data.size(0) - 1 - i)
+        seq_len = min(bptt, self.data.size(0) - i)
 
         end_idx = i + seq_len
         beg_idx = max(0, i - self.ext_len)
@@ -286,16 +286,16 @@ class MixLMOrderedIterator(LMOrderedIterator):
         # Trim off any extra elements that wouldn't cleanly fit (remainders).
         data = data.narrow(0, 0, self.n_step * self.bsz)
         # Evenly divide the data across the bsz batches.
-        self.data = data.view(self.bsz, -1).t().contiguous().to(device)
+        self.data = data.view(self.bsz, -1).t().contiguous()
         data_cl = data_cl.narrow(0, 0, self.n_step*self.bsz)
-        self.data_cl = data_cl.view(self.bsz, -1).t().contiguous().to(device)
+        self.data_cl = data_cl.view(self.bsz, -1).t().contiguous()
         if self.sega:
             p = p.narrow(0, 0, self.n_step * bsz)
             s = s.narrow(0, 0, self.n_step * bsz)
             t = t.narrow(0, 0, self.n_step * bsz)
-            self.p = p.view(bsz, -1).t().contiguous().to(device)
-            self.s = s.view(bsz, -1).t().contiguous().to(device)
-            self.t = t.view(bsz, -1).t().contiguous().to(device)
+            self.p = p.view(bsz, -1).t().contiguous()
+            self.s = s.view(bsz, -1).t().contiguous()
+            self.t = t.view(bsz, -1).t().contiguous()
         # Number of mini-batches
         self.n_batch = (self.n_step + self.bptt - 1) // self.bptt
 
@@ -308,15 +308,15 @@ class MixLMOrderedIterator(LMOrderedIterator):
         i = i*self.bptt
         end_idx = i + seq_len
         beg_idx = max(0, i - self.ext_len)
-        data = self.data[beg_idx:end_idx]
-        target = self.data[i+1:i+1+seq_len]
+        data = self.data[beg_idx:end_idx].to(self.device)
+        target = self.data[i+1:i+1+seq_len].to(self.device)
 
-        cl_data = self.data_cl[beg_idx:end_idx]
-        cl_target = self.data_cl[i+1:i+1+seq_len]
+        cl_data = self.data_cl[beg_idx:end_idx].to(self.device)
+        cl_target = self.data_cl[i+1:i+1+seq_len].to(self.device)
         pst = tuple()
         if self.sega:
-            pst = (self.p[beg_idx:end_idx],
-                   self.s[beg_idx:end_idx], self.t[beg_idx:end_idx])
+            pst = (self.p[beg_idx:end_idx].to(self.device),
+                   self.s[beg_idx:end_idx].to(self.device), self.t[beg_idx:end_idx].to(self.device))
 
         return {'input': data, 'target': target, 'cl_input': cl_data, 'cl_target': cl_target, 'pst':pst}
 
@@ -350,9 +350,14 @@ class MixLMOrderedIterator(LMOrderedIterator):
 
 class MixCorpus(object):
     def __init__(self, args, *_args, **kwargs):
-        path, dataset, sega, sent_eos = args.data, args.dataset, args.sega, args.sent_eos
+        path, dataset, sega, sent_eos, bpe = args.data, args.dataset, args.sega, args.sent_eos, args.bpe
         self.dataset = dataset
-        if sega:
+        if bpe:
+            if sega:
+                self.vocab = SegaBPEVocab(*_args, **kwargs)
+            else:
+                raise NotImplementedError
+        elif sega:
             self.vocab = SegaVocab(*_args, **kwargs)
         else:
             self.vocab = Vocab(*_args, **kwargs)

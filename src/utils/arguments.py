@@ -9,7 +9,7 @@ def boolean_string(s):
     return s == 'True'
 
 ModelSizeArgs = {
-    "small":{
+    "wt_small":{
         "n_layer": 12,
         "d_model": 300,
         "n_head": 10,
@@ -18,7 +18,7 @@ ModelSizeArgs = {
         "tgt_len": 150,
         "eval_tgt_len": 150,
     },
-    "base":{
+    "wt_base":{
         "n_layer":16,
         "d_model":410,
         "n_head":10,
@@ -27,7 +27,25 @@ ModelSizeArgs = {
         "tgt_len": 150,
         "eval_tgt_len": 150,
     },
-    "large":{
+    "wt_large":{
+        "n_layer":18,
+        "d_model":1024,
+        "n_head":16,
+        "d_head":64,
+        "d_inner":4096,
+        "dropout":0.2,
+        "dropatt":0.2,
+    },
+    "arxiv_base":{
+        "n_layer":16,
+        "d_model":410,
+        "n_head":10,
+        "d_head":41,
+        "d_inner":2100,
+        "tgt_len": 384,
+        "eval_tgt_len": 384,
+    },
+    "arxiv_large":{
         "n_layer":18,
         "d_model":1024,
         "n_head":16,
@@ -37,8 +55,7 @@ ModelSizeArgs = {
         "eval_tgt_len":384,
         "dropout":0.2,
         "dropatt":0.2,
-        "warmup_step":16000,
-    }
+    },
 }
 
 def add_model_config_args(parser, is_sagemaker=False):
@@ -147,7 +164,7 @@ def add_training_config_args(parser, is_sagemaker=False):
     group.add_argument('--save_interval', type=int, default=20000,
                         help='evaluation interval')
     group.add_argument('--optim', default='adam', type=str,
-                        choices=['adam', 'sgd', 'adagrad'],
+                        choices=['adam', 'sgd', 'adagrad', 'nag'],
                         help='optimizer to use.')
     group.add_argument('--lr', type=float, default=0.00025,
                         help='initial learning rate (0.00025|5 for adam|sgd)')
@@ -156,18 +173,33 @@ def add_training_config_args(parser, is_sagemaker=False):
     group.add_argument('--scheduler', default='cosine', type=str,
                         choices=['cosine', 'linear', 'None', 'constant'],
                         help='lr scheduler to use.')
+    group.add_argument('--t_mult', type=int, default=2,
+                        help='warmup initial learning rate ')
+    group.add_argument('--lr_shrink', type=float, default=0.75,
+                        help='warmup initial learning rate ')
     group.add_argument('--warmup_step', type=int, default=0,
                         help='upper epoch limit')
+    group.add_argument('--warmup_init_lr', type=float, default=1e-07,
+                        help='warmup initial learning rate ')
     group.add_argument('--decay_rate', type=float, default=0.5,
                         help='decay factor when ReduceLROnPlateau is used')
-    group.add_argument('--lr_min', type=float, default=0.0,
+    group.add_argument('--lr_min', type=float, default=1e-09,
                         help='minimum learning rate during annealing')
+    group.add_argument('--lr_max', type=float, default=1.0,
+                        help='minimum learning rate during annealing')
+    group.add_argument('--lr_period_updates', type=int, default=270000, help='upper epoch limit')
     group.add_argument('--clip', type=float, default=0.25,
                         help='gradient clipping')
     group.add_argument('--max_step', type=int, default=100000,
                         help='upper epoch limit')
     group.add_argument('--batch_size', type=int, default=60,
                         help='batch size')
+    group.add_argument('--accumulation_steps', type=int, default=1,
+                        help='gradient accumulation')
+    group.add_argument('--further_warmup', action='store_true',
+                        help='gradient accumulation')
+    group.add_argument('--auto_continue_slurm', action='store_true',
+                        help='gradient accumulation')
     group.add_argument('--gpu0_bsz', type=int, default=-1,
                         help='batch size on gpu 0')
     group.add_argument('--batch_chunk', type=int, default=1,
@@ -225,7 +257,7 @@ def add_data_config_args(parser, is_sagemaker=False):
     group.add_argument('--data', type=str, default=os.getenv('PT_DATA_DIR', 'data'),
                         help='location of the data corpus')
     group.add_argument('--dataset', type=str, default='wt103',
-                        choices=['wt103', 'lm1b', 'enwik8', 'text8'],
+                        choices=['wt103', 'lm1b', 'enwik8', 'text8','arxiv'],
                         help='dataset name')
     if is_sagemaker:
 
@@ -274,6 +306,8 @@ def add_device_config_args(parser, is_sagemaker=False):
                             help='phillytool or local')
         group.add_argument('--wandb_offline', action='store_true',
                             help='debugging offline')
+    group.add_argument('--wandb_id', default='', type=str,
+                    help='id of wandb')
     group.add_argument('--static-loss-scale', type=float, default=1,
                         help='Static loss scale, positive power of 2 values can '
                         'improve fp16 convergence.')
@@ -364,21 +398,15 @@ def get_args():
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
     args.tied = not args.not_tied
     args.sent_eos=False
-    # if 'eos' in args.sparse_mode:
-    #     args.sent_eos=True
+
     if args.d_embed < 0:
         args.d_embed = args.d_model
 
     assert args.ext_len >= 0, 'extended context length must be non-negative'
     assert args.batch_size % args.batch_chunk == 0
 
-    if args.pt:
-        # this hack is required to enable `pt monitor` *while the job is running*.
-        delattr(tf.io.gfile.LocalFileSystem, 'append')
-        # args.work_dir = os.environ.get('PT_OUTPUT_DIR', '.')
-        args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d'))
-    else:
-        args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d'))
+    args.work_dir = os.path.join(args.work_dir)
+    os.makedirs(args.work_dir, exist_ok=True)
     if is_sagemaker:
         args.work_dir = os.environ['SM_MODEL_DIR']
         args.data = os.environ['SM_CHANNEL_DATA']

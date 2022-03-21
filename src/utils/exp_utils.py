@@ -26,8 +26,8 @@ def upload_model(local_path, remote_path):
     bucket = storage.Client().bucket(bucket_name)
     blob = bucket.blob(remote_path)
     blob.upload_from_filename(local_path)
-    blob = bucket.blob(remote_path.replace("model_optim_rng.pt","wandb.id"))
-    blob.upload_from_filename(local_path.replace("model_optim_rng.pt","wandb.id"))
+    # blob = bucket.blob(remote_path.replace("model_optim_rng.pt","wandb.id"))
+    # blob.upload_from_filename(local_path.replace("model_optim_rng.pt","wandb.id"))
 
 def download_model(local_path, remote_path):
     if remote_path=='':
@@ -96,8 +96,6 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, work_dir, ckpt_fo
         # Optimizer stuff.
         if optimizer is not None:
             sd['optimizer'] = optimizer.state_dict()
-        # if ckpt_folder_name == 'latest':
-        #     sd['param_groups'] = optimizer.param_groups[0]['params']
         if lr_scheduler is not None:
             sd['lr_scheduler'] = lr_scheduler.state_dict()
         # rng states.
@@ -105,7 +103,6 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler, work_dir, ckpt_fo
         sd['np_rng_state'] = np.random.get_state()
         sd['torch_rng_state'] = torch.get_rng_state()
         sd['cuda_rng_state'] = torch.cuda.get_rng_state()
-        sd['rng_tracker_states'] = get_cuda_rng_tracker().get_states()
 
         ensure_directory_exists(checkpoint_name)
         torch.save(sd, checkpoint_name)
@@ -167,16 +164,20 @@ def load_checkpoint(model, optimizer, lr_scheduler, work_dir, ckpt_folder_name=N
 
     # Optimizer.
     if optimizer is not None and 'optimizer' in sd.keys():
-        optimizer.load_state_dict(sd['optimizer'])
+        if 'optimizer_state_dict' in sd['optimizer']:
+            optimizer.load_state_dict(sd['optimizer']['optimizer_state_dict'])
+        else:
+            optimizer.load_state_dict(sd['optimizer'])
         # if "param_groups" in sd.keys():
         #     optimizer.param_groups[0]['params'] = sd["param_groups"]
     if lr_scheduler is not None and 'lr_scheduler' in sd.keys():
         lr_scheduler.load_state_dict(sd['lr_scheduler'])
     # rng states.
-    random.setstate(sd['random_rng_state'])
-    np.random.set_state(sd['np_rng_state'])
-    torch.set_rng_state(sd['torch_rng_state'])
-    torch.cuda.set_rng_state(sd['cuda_rng_state'])
+    if 'random_rng_state' in sd.keys() and 'np_rng_state' in sd.keys() and 'torch_rng_state' in sd.keys():
+        random.setstate(sd['random_rng_state'])
+        np.random.set_state(sd['np_rng_state'])
+        torch.set_rng_state(sd['torch_rng_state'])
+        torch.cuda.set_rng_state(sd['cuda_rng_state'])
     if 'rng_tracker_states' in sd.keys():
         get_cuda_rng_tracker().set_states(sd['rng_tracker_states'])
 

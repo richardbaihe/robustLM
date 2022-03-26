@@ -2,7 +2,7 @@
 
 This repo contains codes of our paper 
 
-> [Better Language Model with Hypernym Class Prediction ](https://arxiv.org/)
+> [Better Language Model with Hypernym Class Prediction ](https://arxiv.org/abs/2203.10692)
 >
 > He Bai, Tong Wang, Alessandro Sordoni, Peng Shi
 >
